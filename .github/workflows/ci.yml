@@ -29,9 +29,12 @@ jobs:
         with:
           version: 9
 
+      # jsdom 30, the vitest environment, requires Node >= 22.22.2. Its undici 8
+      # dependency calls webidl.util.markAsUncloneable at import time, which Node
+      # 20 does not have, so every suite errors before a single test collects.
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
@@ -66,6 +69,9 @@ jobs:
       - name: Embedded installer signature rules
         shell: pwsh
         run: ./scripts/test-verify-installer-signature.ps1
+      - name: Release asset upload rules
+        shell: pwsh
+        run: ./scripts/test-upload-release-asset.ps1
       # Compiling cargo-audit from source took 5m55s of a 9m17s job, to then run
       # for 7 seconds. Cache the built binary instead. The key pins the exact
       # version, so the only way to get a stale tool is to change the pin, which
