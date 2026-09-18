@@ -45,7 +45,7 @@ jobs:
 
       # Install a prebuilt cargo-audit binary instead of compiling it from source
       # (cargo install cargo-audit) on every run.
-      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
           tool: cargo-audit
 
@@ -66,7 +66,8 @@ jobs:
     name: Create GitHub release
     # Intentionally does NOT depend on validate: the release object is only ever a
     # draft here, so it can be created in parallel with validation. publish-release
-    # gates on validate, so an unvalidated build never becomes public.
+    # and submit-store both gate on validate, so an unvalidated build never
+    # becomes public on GitHub or in Partner Center.
     runs-on: ubuntu-latest
     # Metadata only.
     timeout-minutes: 15
@@ -160,7 +161,7 @@ jobs:
 
       - name: Create release
         id: release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.metadata.outputs.tag }}
           name: ${{ steps.metadata.outputs.name }}
@@ -231,7 +232,7 @@ jobs:
       # credentials to Invoke-ArtifactSigning, via its DefaultAzureCredential
       # chain.
       - name: Sign in to Azure with GitHub OIDC
-        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -371,14 +372,16 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.create-release.outputs.tag }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
         run: |
           Copy-Item "${{ steps.installer.outputs.path }}" "${{ steps.installer.outputs.name }}"
           Copy-Item "${{ steps.store-installer.outputs.path }}" "${{ steps.store-installer.outputs.name }}"
-          gh release upload "$env:TAG" `
-            "${{ steps.installer.outputs.name }}" `
-            "${{ steps.store-installer.outputs.name }}" `
-            --clobber
+          ./scripts/upload-release-asset.ps1 `
+            -ReleaseId $env:RELEASE_ID `
+            -AssetPath @(
+              "${{ steps.installer.outputs.name }}",
+              "${{ steps.store-installer.outputs.name }}"
+            )
 
       - name: Re-sign the installer for the updater (over the signed bytes)
         shell: pwsh
@@ -396,9 +399,11 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.create-release.outputs.tag }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
         run: |
-          gh release upload "$env:TAG" "${{ steps.installer.outputs.name }}.sig" --clobber
+          ./scripts/upload-release-asset.ps1 `
+            -ReleaseId $env:RELEASE_ID `
+            -AssetPath "${{ steps.installer.outputs.name }}.sig"
 
       - name: Publish Microsoft Store installer to Cloudflare R2
         if: github.event_name != 'workflow_dispatch'
@@ -489,12 +494,12 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.create-release.outputs.tag }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
           VERSION: ${{ needs.create-release.outputs.version }}
         run: |
           $zip = "Cubby-Clipboard-Portable-$($env:VERSION)-x64.zip"
           Compress-Archive -Path "portable/*" -DestinationPath $zip -Force
-          gh release upload "$env:TAG" $zip --clobber
+          ./scripts/upload-release-asset.ps1 -ReleaseId $env:RELEASE_ID -AssetPath $zip
 
   updater-manifest:
     name: Assemble updater manifest
@@ -511,14 +516,32 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
           TAG: ${{ needs.create-release.outputs.tag }}
           VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          REPO="tsouth89/cubby-clipboard"
+          REPO="btsouth/cubby-clipboard"
           NAME_X64="Cubby.Clipboard_${VERSION}_x64-setup.exe"
           NAME_ARM="Cubby.Clipboard_${VERSION}_arm64-setup.exe"
           BASE="https://github.com/${REPO}/releases/download/${TAG}"
-          gh release download "$TAG" -R "$REPO" -p "${NAME_X64}.sig" -p "${NAME_ARM}.sig" -D sigs
+
+          download_asset() {
+            local name="$1"
+            local destination="$2"
+            local asset_id
+            asset_id=$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+              --jq ".[] | select(.name == \"${name}\") | .id")
+            if [ -z "$asset_id" ] || [[ "$asset_id" == *$'\n'* ]]; then
+              echo "Expected exactly one release asset named ${name}"
+              exit 1
+            fi
+            gh api "repos/${REPO}/releases/assets/${asset_id}" \
+              -H "Accept: application/octet-stream" > "$destination"
+          }
+
+          mkdir -p sigs
+          download_asset "${NAME_X64}.sig" "sigs/${NAME_X64}.sig"
+          download_asset "${NAME_ARM}.sig" "sigs/${NAME_ARM}.sig"
           SIG_X64=$(cat "sigs/${NAME_X64}.sig")
           SIG_ARM=$(cat "sigs/${NAME_ARM}.sig")
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -528,12 +551,31 @@ jobs:
             --arg sa "$SIG_ARM" --arg ua "${BASE}/${NAME_ARM}" \
             '{version:$v, pub_date:$d, platforms:{"windows-x86_64":{signature:$sx,url:$ux},"windows-aarch64":{signature:$sa,url:$ua}}}' \
             > latest.json
-          gh release upload "$TAG" latest.json --clobber
+
+          existing_id=$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | select(.name == "latest.json") | .id')
+          if [ -n "$existing_id" ]; then
+            gh api "repos/${REPO}/releases/assets/${existing_id}" --method DELETE --silent
+          fi
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --header "Content-Type: application/octet-stream" \
+            --data-binary @latest.json \
+            "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=latest.json" \
+            > /dev/null
 
   submit-store:
     name: Submit Microsoft Store update
     if: github.event_name != 'workflow_dispatch'
-    needs: [create-release, build-installers]
+    # SBS-1068: this job runs `msstore submission publish` into Partner Center.
+    # Gate on validate the same way publish-release gates GitHub undraft. A red
+    # or still-running cargo test / clippy / release:check must not reach the
+    # Store. create-release and build-installers stay independent of validate
+    # so the draft release and installer builds can still run in parallel.
+    needs: [validate, create-release, build-installers]
     runs-on: windows-latest
     timeout-minutes: 30
     environment: release
@@ -634,6 +676,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
-        # -R is required: this job has no checkout, so gh has no git context.
-        run: gh release edit "$RELEASE_TAG" -R ${{ github.repository }} --draft=false
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases/${RELEASE_ID}" \
+            --method PATCH \
+            -F draft=false \
+            --silent

@@ -2,7 +2,7 @@ use crate::database::Database;
 use crate::models::AppSettings;
 use crate::settings_load::{
     may_persist_first_run_defaults, promote_interrupted_tmp, recover_dest_gone_replace,
-    resolve_settings_disk_source, settings_tmp_path, SettingsDiskSource,
+    resolve_settings_disk_source, settings_tmp_path, write_settings_temp, SettingsDiskSource,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -336,10 +336,6 @@ impl SettingsManager {
         if let Some(v) = get_val(pool, "mica_effect").await {
             settings.mica_effect = v;
         }
-        if let Some(v) = get_val(pool, "language").await {
-            settings.language = v;
-        }
-
         // Retention is time-only. Ignore any persisted item cap (legacy installs
         // may carry a nonzero max_items from before this was exposed) so the age
         // window is the sole lever; max_items stays 0 = no count cap.
@@ -384,7 +380,7 @@ impl SettingsManager {
         // every preference on the next launch).
         let mut lock = self.settings.write().unwrap();
         let tmp_path = settings_tmp_path(&self.file_path);
-        fs::write(&tmp_path, json).map_err(|e| e.to_string())?;
+        write_settings_temp(&self.file_path, &tmp_path, json.as_bytes())?;
         if let Err(error) = replace_file_atomically(&tmp_path, &self.file_path) {
             // On exFAT/FAT, replace is delete-the-target-then-rename. A failure
             // after the destination entry is gone leaves the temp holding the
@@ -457,6 +453,26 @@ mod tests {
         let recovered = SettingsManager::safe_default_settings();
         assert_eq!(recovered.auto_delete_days, 0);
         assert_eq!(recovered.max_items, 0);
+    }
+
+    #[test]
+    fn pre_i18n_removal_settings_ignore_the_language_key() {
+        let dir =
+            std::env::temp_dir().join(format!("cubby-settings-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut persisted = serde_json::to_value(AppSettings::default()).unwrap();
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .insert("language".to_string(), serde_json::json!("de"));
+        fs::write(&path, serde_json::to_string_pretty(&persisted).unwrap()).unwrap();
+
+        let loaded = SettingsManager::parse_settings_file(&path)
+            .expect("obsolete language setting must not break an upgrade");
+        assert_eq!(loaded.theme, AppSettings::default().theme);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -699,6 +715,36 @@ mod tests {
             !path.exists(),
             "nothing may be written while the temp still holds the only copy"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_after_failed_promote_leaves_the_only_copy_untouched() {
+        let dir =
+            std::env::temp_dir().join(format!("cubby-settings-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let tmp = settings_tmp_path(&path);
+        let recovered = AppSettings {
+            auto_delete_days: 0,
+            ..AppSettings::default()
+        };
+        let recovered_bytes = serde_json::to_string_pretty(&recovered).unwrap();
+        fs::write(&tmp, &recovered_bytes).unwrap();
+
+        let manager = manager_at(&path, recovered.clone());
+        let changed = AppSettings {
+            auto_delete_days: 30,
+            ..recovered.clone()
+        };
+        let error = manager
+            .save(changed)
+            .expect_err("save must refuse to overwrite the recovery temp");
+
+        assert!(error.contains("refusing to overwrite"));
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), recovered_bytes);
+        assert!(!path.exists());
+        assert_eq!(manager.get().auto_delete_days, recovered.auto_delete_days);
         let _ = fs::remove_dir_all(&dir);
     }
 
