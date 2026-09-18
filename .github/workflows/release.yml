@@ -27,9 +27,10 @@ jobs:
         with:
           version: 9
 
+      # Matches CI: jsdom 30 in the lockfile needs Node >= 22.22.2.
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
@@ -82,7 +83,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Validate version and prepare release metadata
         id: metadata
