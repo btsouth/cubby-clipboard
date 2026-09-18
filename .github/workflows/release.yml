@@ -45,7 +45,7 @@ jobs:
 
       # Install a prebuilt cargo-audit binary instead of compiling it from source
       # (cargo install cargo-audit) on every run.
-      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
           tool: cargo-audit
 
@@ -161,7 +161,7 @@ jobs:
 
       - name: Create release
         id: release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.metadata.outputs.tag }}
           name: ${{ steps.metadata.outputs.name }}
@@ -232,7 +232,7 @@ jobs:
       # credentials to Invoke-ArtifactSigning, via its DefaultAzureCredential
       # chain.
       - name: Sign in to Azure with GitHub OIDC
-        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
