@@ -3663,6 +3663,24 @@ mod tests {
         );
     }
 
+    /// A kept image still stores a real generated thumbnail (SBS-1077).
+    #[test]
+    fn kept_image_preview_is_a_generated_thumbnail() {
+        use super::create_image_preview;
+
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .expect("tiny PNG");
+        let png = png.into_inner();
+
+        let preview = create_image_preview(&png).expect("preview");
+        assert!(!preview.is_empty());
+        let decoded = image::load_from_memory(&preview).expect("preview decodes");
+        assert!(decoded.width() <= 320 && decoded.height() <= 220);
+    }
+
     /// Re-introducing `create_image_preview` above the discard gates in
     /// [`super::process_clipboard_snapshot`] makes these assertions fail.
     #[test]
