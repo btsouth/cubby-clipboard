@@ -2,6 +2,12 @@
 
 All notable Cubby Clipboard changes are documented here. PastePaw entries below Cubby's first beta are retained as upstream history and attribution.
 
+## Unreleased
+
+### Fixed
+- Image recapture no longer truncates a destination-gone staging file that is the only remaining original; staging refuses to overwrite it (SBS-1073)
+- Image pastes from Cubby, ignored-app copies, and consecutive duplicate images no longer decode a full PNG thumbnail that is then discarded (SBS-1077)
+
 ## v1.3.3
 
 ### Security
