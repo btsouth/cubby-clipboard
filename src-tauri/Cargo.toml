@@ -30,7 +30,7 @@ aes-gcm = "0.10"
 # to one Windows account, so a bundle encrypted with it could never be restored
 # on another machine; Argon2id is the memory-hard KDF for the user-supplied
 # passphrase that replaces it. Same RustCrypto family as aes-gcm/sha2/hmac.
-argon2 = "0.5"
+argon2 = "0.6"
 getrandom = "0.3"
 image = { version = "0.24", default-features = false, features = ["png"] }
 dirs = "5"
