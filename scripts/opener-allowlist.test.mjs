@@ -14,6 +14,7 @@ import {
   rustGlobMatches,
   urlSlashVariants,
 } from './opener-allowlist.mjs';
+import { readSettingsUiSource } from './release-check-helpers.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -121,7 +122,7 @@ test('authority wildcards are wide open, including a dropped-slash host glob', (
 });
 
 test('Settings const URL assignments reach the allowlist check', () => {
-  // check-release runs extractHttpUrlLiterals over SettingsPanel.tsx, so this
+  // check-release runs extractHttpUrlLiterals over the Settings UI sources, so this
   // is the layer that has to see them. extractOpenedUrls deliberately does not
   // -- it runs over all of frontend/src, where the same shape is test fixtures.
   const source = [
@@ -191,11 +192,8 @@ test('extractHttpUrlLiterals finds Settings object and call-site URLs the const 
   ]);
 });
 
-test('live SettingsPanel quoted URLs are the three product links', async () => {
-  const source = await readFile(
-    path.join(repoRoot, 'frontend/src/components/SettingsPanel.tsx'),
-    'utf8'
-  );
+test('live Settings UI quoted URLs are the three product links', async () => {
+  const source = await readSettingsUiSource(repoRoot);
   assert.deepEqual(extractHttpUrlLiterals(source), [
     'https://github.com/btsouth/cubby-clipboard',
     'https://cubbyclipboard.com',

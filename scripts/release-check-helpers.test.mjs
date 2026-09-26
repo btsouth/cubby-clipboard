@@ -9,6 +9,7 @@ import {
   extractDefaultSkipLikelySecrets,
   extractMarkdownBullets,
   saysDefaultOff,
+  readSettingsUiSource,
 } from './release-check-helpers.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -107,10 +108,7 @@ test('locale helper accepts the same off-phrasings as the security-doc gate', ()
 test('live models.rs, SECURITY.md, and Settings agree the default is off', async () => {
   const models = await readFile(path.join(repoRoot, 'src-tauri/src/models.rs'), 'utf8');
   const security = await readFile(path.join(repoRoot, 'SECURITY.md'), 'utf8');
-  const settingsPanel = await readFile(
-    path.join(repoRoot, 'frontend/src/components/SettingsPanel.tsx'),
-    'utf8',
-  );
+  const settingsPanel = await readSettingsUiSource(repoRoot);
   assert.equal(extractDefaultSkipLikelySecrets(models), 'false');
   const { sayOn, sayOff } = evaluateSecretHeuristicsDoc(security);
   assert.equal(sayOn, false);
