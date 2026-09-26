@@ -169,3 +169,47 @@ or synchronization client to release the clipboard. The fixture writer takes the
 clipboard on the same terms when it publishes a delayed payload, so probe
 failures reflect capture behavior rather than a writer that gave up sooner than
 production would have.
+
+## Excel copy contention
+
+Excel publishes a copy in two steps. It empties the clipboard, which fires a
+`WM_CLIPBOARDUPDATE` with nothing on it, then about 6 to 9 ms later opens the
+clipboard again to publish roughly 25 delayed-rendered formats. If that second
+`OpenClipboard` fails, Excel retries once about 0.1 ms later and then shows
+"There's a problem with the clipboard". Any listener that opens the clipboard
+in that gap causes the warning, and the paste that follows is often empty.
+
+Cubby 1.3.3 did exactly that: on the empty update it opened the clipboard about
+twenty times looking for text, HTML and RTF. In-process traces tied every
+warning to a failed Excel open during that gap.
+
+Capture now follows these rules:
+
+- Never open the clipboard for an empty update. `CountClipboardFormats` and
+  `IsClipboardFormatAvailable` answer without `OpenClipboard`.
+- Read payloads through OLE (`OleGetClipboard`, `IDataObject::GetData`). OLE
+  holds the clipboard only briefly to reach the owner's data object, and Excel
+  renders straight into the returned medium without the clipboard locked.
+- Do not materialize a sequence again after it was captured. Delayed rendering
+  posts more notifications for the same sequence.
+- Bind the payload to the sequence seen right after the last read, not when the
+  result reaches the capture thread. Excel starts the next queued copy as soon
+  as it finishes rendering, and a later check discarded copies that had been
+  read correctly.
+- When a capture gives up because the sequence kept moving, do not mark the new
+  sequence handled. Its own notification is still queued.
+- OLE reads run on a dedicated apartment thread. `GetData` into a frozen owner
+  never returns, and on an STA neither `CoCancelCall` nor a message filter can
+  interrupt it. The capture thread waits at most 30 s, the same limit Windows
+  applies to `WM_RENDERFORMAT`, records that copy as not captured, and later
+  reads get a fresh thread.
+- If an OLE read fails while the sequence is unchanged, retry that format with
+  `GetClipboardData` as before. Never fall back once the sequence has moved.
+
+`scripts/test-excel-copy.ps1` drives real Excel with Ctrl+C against a synthetic
+workbook and interleaves Cubby builds in rotating order. It records Excel's
+warning dialog, paste results through a separate EDIT control, and whether each
+copy produced a capture. `scripts/test-capture-reader.ps1` checks exact capture
+of rich, image, privacy-marker and live OLE fixtures through the production
+listener; `-HungOwner` checks that a copy made while another clipboard owner is
+frozen is still captured before that owner wakes.
