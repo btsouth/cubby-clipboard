@@ -3,6 +3,7 @@ use tauri::{AppHandle, Emitter};
 use crate::database::Database;
 #[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(not(target_os = "windows"))]
 use clipboard_rs::common::RustImage;
 #[cfg(not(target_os = "windows"))]
 use clipboard_rs::common::RustImageData;
@@ -10,6 +11,7 @@ use clipboard_rs::common::RustImageData;
 // under one clipboard handle, so the typed content enum is portable-path only.
 #[cfg(not(target_os = "windows"))]
 use clipboard_rs::ClipboardContent;
+#[cfg(not(target_os = "windows"))]
 use clipboard_rs::{Clipboard, ClipboardContext};
 #[cfg(target_os = "windows")]
 use clipboard_win::Monitor;
@@ -699,6 +701,12 @@ fn persist_if_sequence_holds<T>(
 
 /// Retry a delayed materialize, but abort as soon as the sequence moves so a
 /// later (possibly sensitive) payload is never kept with earlier metadata.
+///
+/// `attempt` also returns the sequence it saw right after its last clipboard
+/// read. If that still equals `expected`, every read came from that one copy.
+/// A copy that lands afterwards has its own notification; checking the live
+/// sequence here instead discarded payloads read correctly, and Excel starts
+/// the next queued copy the moment it finishes rendering the last format.
 fn materialize_with_sequence_guard<F, T>(
     expected: u32,
     read_sequence: impl Fn() -> u32,
@@ -706,7 +714,7 @@ fn materialize_with_sequence_guard<F, T>(
     max_attempts: u32,
 ) -> Result<Option<T>, SequenceBindError>
 where
-    F: FnMut(u32) -> Option<T>,
+    F: FnMut(u32) -> Option<(T, u32)>,
 {
     for index in 0..max_attempts {
         let current = read_sequence();
@@ -716,12 +724,11 @@ where
                 to: current,
             });
         }
-        if let Some(value) = attempt(index) {
-            let current = read_sequence();
-            if current != expected {
+        if let Some((value, after_reads)) = attempt(index) {
+            if after_reads != expected {
                 return Err(SequenceBindError::Changed {
                     from: expected,
-                    to: current,
+                    to: after_reads,
                 });
             }
             return Ok(Some(value));
@@ -797,10 +804,15 @@ fn capture_clipboard_update(
         }
     }
 
+    // Do not mark `current` handled: the change that outran this capture has
+    // its own WM_CLIPBOARDUPDATE queued, and the duplicate-sequence guard
+    // would skip it. Excel publishes ~30 sequence steps in under a millisecond,
+    // so this happens on ordinary copies. The listener is still alive, so keep
+    // the watchdog from restarting it; it still catches a lost notification.
+    LAST_CLIPBOARD_EVENT_UNIX_MS.store(unix_now_ms(), Ordering::SeqCst);
     let current = read_sequence();
-    note_clipboard_event(current);
-    log::warn!(
-        "CLIPBOARD: Discarded capture because sequence {} kept changing during read",
+    log::debug!(
+        "CLIPBOARD: Sequence {} kept changing during capture; waiting for its notification",
         current
     );
     Ok(CaptureAttempt::Handled)
@@ -831,6 +843,24 @@ fn capture_one_bound_sequence(
     if live != sequence {
         // The event sequence is already stale. Capture whatever is current.
         sequence = live;
+    }
+
+    // Delayed rendering can enqueue more notifications while this thread is
+    // materializing. A notification is not a new copy: do not reopen a sequence
+    // whose snapshot was already queued. Never suppress unknown sequence zero.
+    if sequence != 0 && sequence == LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst) {
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    // Excel closes an empty clipboard before publishing its new formats. Do
+    // not compete with that publication by opening it to discover it is empty.
+    // Keep the existing sequence-bound clear event (password auto-clear).
+    if clipboard_format_count_is_zero() && !clipboard_has_supported_format() {
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        note_clipboard_event(sequence);
+        return enqueue_listener_event(event_tx, ClipboardListenerEvent::Cleared { sequence })
+            .map(|_| CaptureAttempt::Handled)
+            .map_err(|_| BoundCaptureFailure::ConsumerGone);
     }
 
     // File clipboard payloads are references to external paths, not durable
@@ -864,27 +894,38 @@ fn capture_one_bound_sequence(
         return Ok(CaptureAttempt::Handled);
     }
 
+    if !clipboard_has_supported_format() {
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        note_clipboard_event(sequence);
+        return Ok(CaptureAttempt::Handled);
+    }
+
     let materialized = materialize_with_sequence_guard(
         sequence,
         read_sequence,
-        |attempt| match materialize_clipboard_content_once(attempt) {
-            MaterializeOnce::Captured(content, formats) => {
-                Some(MaterializeAttempt::Captured(content, formats))
-            }
-            MaterializeOnce::DeterminateMiss => Some(MaterializeAttempt::DeterminateMiss),
-            MaterializeOnce::Transient => {
-                if attempt + 1 < 10 {
-                    std::thread::sleep(clipboard_retry_delay(attempt));
+        |attempt| {
+            let (outcome, after_reads) = materialize_clipboard_content_once(attempt);
+            let decided = match outcome {
+                MaterializeOnce::Captured(content, formats) => {
+                    MaterializeAttempt::Captured(content, formats)
                 }
-                None
-            }
+                MaterializeOnce::DeterminateMiss => MaterializeAttempt::DeterminateMiss,
+                MaterializeOnce::Unresponsive => MaterializeAttempt::Unresponsive,
+                MaterializeOnce::Transient => {
+                    if attempt + 1 < 10 {
+                        std::thread::sleep(clipboard_retry_delay(attempt));
+                    }
+                    return None;
+                }
+            };
+            Some((decided, after_reads))
         },
         10,
     )?;
 
-    persist_if_sequence_holds(sequence, read_sequence(), ())?;
-
     if let Some(MaterializeAttempt::Captured(content, formats)) = materialized {
+        // The guard proved every read came from `sequence`. Queue it even if a
+        // newer copy has landed since; that copy is captured on its own.
         note_clipboard_event(sequence);
         // Bind the live marker onto this work item (SBS-1022). If flood
         // policy later evicts it, enqueue_listener_event must release that
@@ -906,6 +947,18 @@ fn capture_one_bound_sequence(
         return enqueue_listener_event(event_tx, ClipboardListenerEvent::Content(snapshot))
             .map(|_| CaptureAttempt::Handled)
             .map_err(|_| BoundCaptureFailure::ConsumerGone);
+    }
+
+    persist_if_sequence_holds(sequence, read_sequence(), ())?;
+
+    if matches!(materialized, Some(MaterializeAttempt::Unresponsive)) {
+        // Each retry would wait out the same 30 s. Later copies get a fresh
+        // reader thread, so capture continues while this owner stays hung.
+        note_clipboard_event(sequence);
+        record_capture_error(format!(
+            "clipboard owner did not render sequence {sequence} within 30 s; that copy was not captured"
+        ));
+        return Ok(CaptureAttempt::Handled);
     }
 
     if matches!(materialized, Some(MaterializeAttempt::DeterminateMiss)) {
@@ -1003,28 +1056,10 @@ fn capture_one_bound_sequence(
 /// opened the clipboard and read empty text must not use this as a lock signal.
 #[cfg(target_os = "windows")]
 fn clipboard_has_supported_format() -> bool {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::DataExchange::{
-        IsClipboardFormatAvailable, RegisterClipboardFormatW,
-    };
-
-    const CF_TEXT: u32 = 1;
-    const CF_BITMAP: u32 = 2;
-    const CF_DIB: u32 = 8;
-    const CF_UNICODETEXT: u32 = 13;
-    const CF_DIBV5: u32 = 17;
-
-    if [CF_UNICODETEXT, CF_TEXT, CF_DIB, CF_DIBV5, CF_BITMAP]
-        .into_iter()
-        .any(|format| unsafe { IsClipboardFormatAvailable(format) }.is_ok())
-    {
-        return true;
-    }
-
-    // Some producers put only a registered "PNG" entry on the clipboard.
-    let name: Vec<u16> = "PNG".encode_utf16().chain(std::iter::once(0)).collect();
-    let png_format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
-    png_format != 0 && unsafe { IsClipboardFormatAvailable(png_format) }.is_ok()
+    clipboard_has_unicode_text_format()
+        || clipboard_has_html_format()
+        || clipboard_has_rtf_format()
+        || clipboard_has_image_format()
 }
 
 #[cfg(target_os = "windows")]
@@ -1142,64 +1177,26 @@ fn run_listener_session(
 /// Returns false when the clipboard cannot be opened (contention) so we never
 /// treat a lock miss as an auto-clear.
 fn clipboard_is_cleared() -> bool {
-    const ATTEMPTS: u32 = 5;
-
-    for attempt in 0..ATTEMPTS {
-        if let Ok(ctx) = ClipboardContext::new() {
-            if let Ok(files) = ctx.get_files() {
-                if !files.is_empty() {
-                    return false;
-                }
-            }
-            if ctx.get_image().is_ok() {
-                return false;
-            }
-            // Empty plain text must not count as a clear if HTML/RTF still hold
-            // content. Those copies are stored as rich clips (SBS-924).
-            if clipboard_html_document(&ctx).is_some_and(|html| !html.is_empty()) {
-                return false;
-            }
-            if let Ok(rtf) = ctx.get_rich_text() {
-                if !rtf.is_empty() {
-                    return false;
-                }
-            }
-            match ctx.get_text() {
-                Ok(text) if !text.is_empty() => return false,
-                // Empty text only counts as a clear when nothing else is on the
-                // clipboard. An empty CF_UNICODETEXT written alongside an app's
-                // private format is a normal copy of unsupported content, and
-                // treating it as a clear used to delete the previous capture.
-                Ok(_) => return clipboard_only_has_placeholder_text_formats(),
-                Err(_) => {
-                    // No readable text. If there are no formats at all, it is a clear;
-                    // otherwise something unsupported/custom remains — leave it alone.
-                    return clipboard_format_count_is_zero();
-                }
-            }
-        }
-
-        if attempt + 1 < ATTEMPTS {
-            std::thread::sleep(clipboard_retry_delay(attempt));
-        }
+    if clipboard_format_count_is_zero() {
+        return true;
     }
-
-    false
+    if !clipboard_only_has_placeholder_text_formats() {
+        return false;
+    }
+    // The only remaining candidate is empty text. Never render images or rich
+    // formats merely to decide whether a clipboard with those formats is empty.
+    #[cfg(target_os = "windows")]
+    return crate::clipboard_reader::with_reader(|reader| reader.text())
+        .is_ok_and(|(text, _)| text.is_ok_and(|text| text.is_empty()));
+    #[cfg(not(target_os = "windows"))]
+    ClipboardContext::new()
+        .and_then(|ctx| ctx.get_text())
+        .is_ok_and(|text| text.is_empty())
 }
 
 #[cfg(target_os = "windows")]
 fn clipboard_format_count_is_zero() -> bool {
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, CountClipboardFormats, OpenClipboard,
-    };
-
-    let opened = unsafe { OpenClipboard(None) };
-    if opened.is_err() {
-        return false;
-    }
-    let count = unsafe { CountClipboardFormats() };
-    let _ = unsafe { CloseClipboard() };
-    count == 0
+    crate::clipboard_reader::is_empty()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1345,6 +1342,190 @@ fn run_native_listener(_event_tx: snapshot_channel::Sender<ClipboardListenerEven
 /// Empty Unicode text is a determinate miss, not a retryable lock: if HTML or
 /// RTF has content we store that clip; otherwise the caller marks the sequence
 /// handled (or cleared) without restarting the listener (SBS-924).
+/// Also returns the clipboard sequence seen right after the last read (see
+/// [`materialize_with_sequence_guard`]).
+#[cfg(target_os = "windows")]
+fn materialize_clipboard_content_once(attempt: u32) -> (MaterializeOnce, u32) {
+    let sequence = || unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    // A sequence may become empty while we are binding metadata. The outer
+    // sequence guard will rebind it; never open an empty publication in here.
+    if !clipboard_has_supported_format() {
+        return (MaterializeOnce::DeterminateMiss, sequence());
+    }
+    match crate::clipboard_reader::with_reader(move |reader| {
+        materialize_from_reader(reader, attempt)
+    }) {
+        Ok(read) => read,
+        Err(crate::clipboard_reader::ReadFailure::Unresponsive) => {
+            (MaterializeOnce::Unresponsive, sequence())
+        }
+        Err(crate::clipboard_reader::ReadFailure::Failed(error)) => {
+            log::debug!("CLIPBOARD: Clipboard read attempt failed: {error}");
+            (MaterializeOnce::Transient, sequence())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn materialize_from_reader(
+    reader: &crate::clipboard_reader::Reader,
+    attempt: u32,
+) -> MaterializeOnce {
+    let last_attempt = attempt + 1 == 10;
+    if clipboard_has_image_format() && clipboard_has_file_payload_format() {
+        return match read_clipboard_image(reader, last_attempt) {
+            Ok(image) => MaterializeOnce::Captured(captured_image(image), Vec::new()),
+            Err(_) => MaterializeOnce::Transient,
+        };
+    }
+
+    let text = reader.text().ok();
+    let html = reader
+        .bytes(register_clipboard_format("HTML Format"))
+        .ok()
+        .and_then(|bytes| crate::cf_html::html_document_from_cf_html(&bytes));
+    let rtf = reader
+        .bytes(register_clipboard_format("Rich Text Format"))
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let text_read = observed_payload(&text, clipboard_has_unicode_text_format());
+    let html_read = observed_payload(&html, clipboard_has_html_format());
+    let rtf_read = observed_payload(&rtf, clipboard_has_rtf_format());
+    let image_advertised = clipboard_has_image_format();
+    // Match the decision policy before starting expensive rendering: unread
+    // advertised text retries first. Empty/missing text still permits pictures.
+    let needs_image =
+        crate::clipboard_miss::needs_image_read(text_read, image_advertised, last_attempt);
+    let image = needs_image
+        .then(|| read_clipboard_image(reader, last_attempt).ok())
+        .flatten();
+    match crate::clipboard_miss::decide_capture(crate::clipboard_miss::AttemptFacts {
+        text: text_read,
+        html: html_read,
+        rtf: rtf_read,
+        image_advertised,
+        image_readable: image.is_some(),
+        last_attempt,
+    }) {
+        crate::clipboard_miss::CaptureDecision::Image => match image {
+            Some(image) => MaterializeOnce::Captured(captured_image(image), Vec::new()),
+            None => MaterializeOnce::Transient,
+        },
+        crate::clipboard_miss::CaptureDecision::Rich(rich) => {
+            match capture_text(rich.searchable_text) {
+                Some(content) => {
+                    MaterializeOnce::Captured(content, captured_rich_formats(rich.html, rich.rtf))
+                }
+                None => MaterializeOnce::DeterminateMiss,
+            }
+        }
+        crate::clipboard_miss::CaptureDecision::DeterminateMiss => MaterializeOnce::DeterminateMiss,
+        crate::clipboard_miss::CaptureDecision::Transient => MaterializeOnce::Transient,
+    }
+}
+
+/// All payload bytes are detached from the OLE medium before image parsing or
+/// PNG encoding. PNG remains byte-for-byte intact; DIB uses the same decoder
+/// family as clipboard-rs and keeps the existing image content/hash policy.
+#[cfg(target_os = "windows")]
+fn read_clipboard_image(
+    reader: &crate::clipboard_reader::Reader,
+    allow_slow_fallback: bool,
+) -> Result<ClipboardImageRead, String> {
+    use std::io::Cursor;
+    let png_format = registered_png_format();
+    if crate::clipboard_reader::available(png_format) {
+        let png_result = reader.bytes(png_format).and_then(|png_bytes| {
+            let (width, height) = image::io::Reader::new(Cursor::new(&png_bytes))
+                .with_guessed_format()
+                .map_err(|e| e.to_string())?
+                .into_dimensions()
+                .map_err(|e| e.to_string())?;
+            Ok(ClipboardImageRead {
+                raw_hash: calculate_hash(&png_bytes),
+                png_bytes,
+                width,
+                height,
+                decode_ms: 0,
+                source_type: "registered-png",
+            })
+        });
+        match png_result {
+            Ok(image) => return Ok(image),
+            Err(error) if !allow_slow_fallback => return Err(error),
+            Err(_) => {}
+        }
+    }
+    // A CF_DIBV5 that cannot be read or decoded must not hide a usable CF_DIB.
+    let mut decoded = Err("clipboard has no bitmap format".to_string());
+    for format in [17, 8] {
+        if crate::clipboard_reader::available(format) {
+            decoded = reader.bytes(format).and_then(decode_clipboard_dib);
+            if decoded.is_ok() {
+                break;
+            }
+        }
+    }
+    let image = decoded?;
+    let raw_hash = calculate_hash(image.as_bytes());
+    let (width, height) = (image.width(), image.height());
+    let mut png = Cursor::new(Vec::new());
+    image
+        .to_rgba8()
+        .write_to(&mut png, image_capture::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(ClipboardImageRead {
+        png_bytes: png.into_inner(),
+        width,
+        height,
+        raw_hash,
+        decode_ms: 0,
+        source_type: "ole-dib",
+    })
+}
+
+/// `image` 0.25.10's headerless decoder skips another 12 mask bytes after V4/V5
+/// BI_BITFIELDS headers, although those masks are already inside the header.
+/// Supply an explicit BMP pixel offset for these packed DIBs. Keep the existing
+/// decoder/encoder for pixel and hash compatibility, without discarding alpha.
+#[cfg(target_os = "windows")]
+fn decode_clipboard_dib(mut bytes: Vec<u8>) -> Result<image_capture::DynamicImage, String> {
+    use std::io::Cursor;
+    let dword = |offset| {
+        bytes
+            .get(offset..offset + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("four bytes")))
+    };
+    let header_size = dword(0).unwrap_or(0);
+    let extended_bitfields = matches!(header_size, 108 | 124) && dword(16) == Some(3);
+    let decoder = if extended_bitfields {
+        // Packed clipboard DIBs place pixels after the header and color table;
+        // a V5 embedded profile follows the pixels, not the other way around.
+        let colors = dword(32).ok_or("truncated DIB header")?;
+        let offset = colors
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(header_size))
+            .filter(|&n| n as usize <= bytes.len())
+            .ok_or("invalid DIB color table")?;
+        let file_size = u32::try_from(bytes.len())
+            .ok()
+            .and_then(|n| n.checked_add(14))
+            .ok_or("DIB is too large for a BMP header")?;
+        let mut header = Vec::with_capacity(14);
+        header.extend_from_slice(b"BM");
+        header.extend_from_slice(&file_size.to_le_bytes());
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&(offset + 14).to_le_bytes());
+        drop(bytes.splice(..0, header));
+        image_capture::codecs::bmp::BmpDecoder::new(Cursor::new(bytes))
+    } else {
+        image_capture::codecs::bmp::BmpDecoder::new_without_file_header(Cursor::new(bytes))
+    }
+    .map_err(|e| e.to_string())?;
+    image_capture::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
 fn materialize_clipboard_content_once(attempt: u32) -> MaterializeOnce {
     const ATTEMPTS: u32 = 10;
     let last_attempt = attempt + 1 == ATTEMPTS;
@@ -1457,6 +1638,7 @@ fn clipboard_has_html_format() -> bool {
 /// `end - start <= len`. A header whose EndHTML is past the payload panics, and
 /// release builds abort the process (SBS-999). Raw bytes plus
 /// [`crate::cf_html::html_document_from_cf_html`] drop the format instead.
+#[cfg(not(target_os = "windows"))]
 fn clipboard_html_document(ctx: &ClipboardContext) -> Option<String> {
     let bytes = ctx.get_buffer("HTML Format").ok()?;
     crate::cf_html::html_document_from_cf_html(&bytes)
@@ -1503,12 +1685,17 @@ enum MaterializeOnce {
     Captured(CapturedContent, Vec<CapturedFormat>),
     DeterminateMiss,
     Transient,
+    /// The owner did not render within Windows' 30 s delayed-render limit.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Unresponsive,
 }
 
-/// Stop retrying once we know the copy is captured or is a determinate miss.
+/// Stop retrying once we know the copy is captured, is a determinate miss, or
+/// its owner stopped responding.
 enum MaterializeAttempt {
     Captured(CapturedContent, Vec<CapturedFormat>),
     DeterminateMiss,
+    Unresponsive,
 }
 
 fn captured_image(image: ClipboardImageRead) -> CapturedContent {
@@ -1542,6 +1729,7 @@ fn capture_text(text: String) -> Option<CapturedContent> {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn read_clipboard_image_with_clipboard_rs(
     source_type: &'static str,
 ) -> Result<ClipboardImageRead, String> {
@@ -1568,45 +1756,8 @@ fn read_clipboard_image_with_clipboard_rs(
     })
 }
 
-#[cfg(target_os = "windows")]
-fn read_registered_png_fast() -> Result<ClipboardImageRead, String> {
-    use std::io::Cursor;
-
-    let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
-    let png_bytes = ctx.get_buffer("PNG").map_err(|e| e.to_string())?;
-    let reader = image::io::Reader::new(Cursor::new(&png_bytes))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?;
-    let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
-
-    Ok(ClipboardImageRead {
-        raw_hash: calculate_hash(&png_bytes),
-        png_bytes,
-        width,
-        height,
-        decode_ms: 0,
-        source_type: "registered-png",
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn clipboard_has_registered_png() -> bool {
-    use windows::Win32::System::DataExchange::IsClipboardFormatAvailable;
-
-    let format = registered_png_format();
-    format != 0 && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
-}
-
-fn read_clipboard_image_fast(allow_slow_fallback: bool) -> Result<ClipboardImageRead, String> {
-    #[cfg(target_os = "windows")]
-    if clipboard_has_registered_png() {
-        match read_registered_png_fast() {
-            Ok(image) => return Ok(image),
-            Err(error) if !allow_slow_fallback => return Err(error),
-            Err(_) => {}
-        }
-    }
-
+#[cfg(not(target_os = "windows"))]
+fn read_clipboard_image_fast(_allow_slow_fallback: bool) -> Result<ClipboardImageRead, String> {
     read_clipboard_image_with_clipboard_rs("clipboard-rs-image")
 }
 
@@ -3488,8 +3639,51 @@ unsafe fn extract_icon(path: &str) -> Option<String> {
     Some(BASE64.encode(&png_data))
 }
 
+#[cfg(all(target_os = "windows", feature = "dev-harness"))]
+#[path = "clipboard/capture_probe.rs"]
+mod capture_probe;
+#[cfg(all(target_os = "windows", feature = "dev-harness"))]
+pub use capture_probe::run_capture_probe;
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn packed_v4_and_v5_bitfields_keep_exact_pixels_and_alpha() {
+        for size in [108_u32, 124] {
+            let mut dib = vec![0_u8; size as usize];
+            for (offset, value) in [
+                (0, size),
+                (4, 2),
+                (8, (-2_i32) as u32),
+                (16, 3),
+                (20, 16),
+                (40, 0x00ff0000),
+                (44, 0x0000ff00),
+                (48, 0x000000ff),
+                (52, 0xff000000),
+                (56, 0x73524742),
+            ] {
+                dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            dib[12] = 1;
+            dib[14] = 32;
+            dib.extend_from_slice(&[
+                0, 0, 201, 255, 0, 255, 0, 128, 255, 0, 0, 64, 255, 255, 255, 0,
+            ]);
+            let image = super::decode_clipboard_dib(dib.clone()).expect("valid packed DIB");
+            assert_eq!(
+                image.to_rgba8().as_raw(),
+                &[201, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 0]
+            );
+            dib[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(
+                super::decode_clipboard_dib(dib).is_err(),
+                "invalid palette must not overflow"
+            );
+        }
+    }
+
     use super::{
         bind_ignore_hash_for_queued_work, build_clip_hash_material, calculate_hash,
         capture_state_name, capture_text, captured_clip_hash, clear_ignore_hash_if_matches,
@@ -4010,7 +4204,7 @@ mod tests {
                         sequence.store(21, Ordering::SeqCst);
                         None
                     } else {
-                        Some(PASSWORD)
+                        Some((PASSWORD, sequence.load(Ordering::SeqCst)))
                     }
                 },
                 4,
@@ -4020,6 +4214,30 @@ mod tests {
                 Err(SequenceBindError::Changed { from: 20, to: 21 })
             ));
             assert_ne!(result.ok().flatten(), Some(PASSWORD));
+        }
+
+        #[test]
+        fn a_change_before_the_last_read_rejects_the_payload() {
+            let result = materialize_with_sequence_guard(40, || 40, |_| Some((PASSWORD, 41)), 4);
+            assert_eq!(result, Err(SequenceBindError::Changed { from: 40, to: 41 }));
+        }
+
+        #[test]
+        fn a_copy_after_the_last_read_keeps_the_payload_read_before_it() {
+            // Excel starts the next queued copy as soon as it has rendered the
+            // last format, often before the capture thread gets its result.
+            let sequence = AtomicU32::new(30);
+            let result = materialize_with_sequence_guard(
+                30,
+                || sequence.load(Ordering::SeqCst),
+                |_| {
+                    let after_reads = sequence.load(Ordering::SeqCst);
+                    sequence.store(31, Ordering::SeqCst);
+                    Some(("first copy", after_reads))
+                },
+                4,
+            );
+            assert_eq!(result, Ok(Some("first copy")));
         }
 
         #[test]

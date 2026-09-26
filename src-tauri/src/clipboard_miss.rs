@@ -60,6 +60,21 @@ pub(crate) enum CaptureDecision {
     Transient,
 }
 
+/// Avoid rendering a bitmap that the text-first decision cannot use yet.
+/// Empty Unicode is different from an unread advertised Unicode payload.
+pub(crate) fn needs_image_read(
+    text: PayloadRead<'_>,
+    advertised: bool,
+    last_attempt: bool,
+) -> bool {
+    advertised
+        && match text {
+            PayloadRead::Present(body) => body.is_empty(),
+            PayloadRead::Unknown => last_attempt,
+            PayloadRead::Missing => true,
+        }
+}
+
 /// Decide one attempt from what it observed.
 ///
 /// Order is the whole point:
@@ -807,5 +822,19 @@ mod tests {
     #[test]
     fn rtf_unicode_control_word_emits_the_codepoint() {
         assert_eq!(plain_text_from_rtf(r"{\rtf1\u12354?}"), "あ");
+    }
+}
+
+#[cfg(test)]
+mod image_read_tests {
+    use super::{needs_image_read, PayloadRead};
+    #[test]
+    fn rendering_follows_text_priority_without_losing_picture_fallbacks() {
+        assert!(!needs_image_read(PayloadRead::Unknown, true, false));
+        assert!(needs_image_read(PayloadRead::Unknown, true, true));
+        assert!(needs_image_read(PayloadRead::Present(""), true, false));
+        assert!(needs_image_read(PayloadRead::Missing, true, false));
+        assert!(!needs_image_read(PayloadRead::Present("cell"), true, true));
+        assert!(!needs_image_read(PayloadRead::Missing, false, true));
     }
 }
