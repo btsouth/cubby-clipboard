@@ -892,6 +892,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "image 0.24.9",
+ "image 0.25.10",
  "log",
  "once_cell",
  "parking_lot",

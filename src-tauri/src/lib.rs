@@ -21,6 +21,8 @@ mod clip_list;
 mod clipboard;
 mod clipboard_miss;
 mod clipboard_policy;
+#[cfg(target_os = "windows")]
+mod clipboard_reader;
 // SBS-1042: restore/copy must not emit decrypted bodies to the WebView.
 // Compiled for tests so the source pin runs on every `cargo test`; a release
 // build does not include it.
@@ -1606,3 +1608,6 @@ mod flyout_tests {
         );
     }
 }
+
+#[cfg(all(target_os = "windows", feature = "dev-harness"))]
+pub use clipboard::run_capture_probe;
