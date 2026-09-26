@@ -104,7 +104,8 @@ $oleText.SetData([System.Windows.Forms.DataFormats]::UnicodeText,$false,'CUBBY-O
 $fixtures.Add(@{ole=$oleText;expected=@{text='CUBBY-OLE-LIVE-TEXT'}})
 $oleDib=New-Object System.Windows.Forms.DataObject
 $oleDib.SetData([System.Windows.Forms.DataFormats]::Dib,$false,(New-Object IO.MemoryStream(,[CaptureFixtures]::Dib32())))
-$fixtures.Add(@{ole=$oleDib;expected=@{image_size=@(2,2)}})
+# Dib32 stores 0xff3366cc per pixel in BGRA order.
+$fixtures.Add(@{ole=$oleDib;expected=@{image_size=@(2,2);image_rgba=@(51,102,204,255)*4}})
 function Wait-Pumping([int]$milliseconds){$until=[DateTime]::UtcNow.AddMilliseconds($milliseconds);while([DateTime]::UtcNow -lt $until){[System.Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 5}}
 function Start-Probe([string]$name,$expected,[int]$seconds){
  [IO.File]::WriteAllText("$dir\$name-manifest.json",(ConvertTo-Json -InputObject @($expected) -Depth 5),[Text.UTF8Encoding]::new($false))

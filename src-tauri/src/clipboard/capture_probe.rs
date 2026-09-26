@@ -21,6 +21,29 @@ pub fn run_capture_probe(
         image_rgba: Option<Vec<u8>>,
         sensitive: Option<bool>,
     }
+    // Capture logs carry sequence numbers and outcomes, never payloads. The
+    // fixture scripts redirect stderr to a file, so a missed fixture leaves a
+    // trace of why.
+    struct StderrLog(Instant);
+    impl log::Log for StderrLog {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.target().starts_with("cubby::clipboard")
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                eprintln!(
+                    "{:>7}ms {} {}",
+                    self.0.elapsed().as_millis(),
+                    record.level(),
+                    record.args()
+                );
+            }
+        }
+        fn flush(&self) {}
+    }
+    if log::set_boxed_logger(Box::new(StderrLog(Instant::now()))).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
     let fixtures: Vec<Fixture> =
         serde_json::from_slice(&std::fs::read(manifest_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;

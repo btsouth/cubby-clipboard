@@ -6,8 +6,9 @@
 //! Reads run on their own apartment thread. GetClipboardData gives up on a hung
 //! owner after 30 s, but GetData into a live OLE source waits for as long as
 //! that source is frozen, and on an STA neither CoCancelCall nor a message
-//! filter interrupts it. The capture thread stops waiting after the same 30 s
-//! and leaves that thread to finish, or to fail when its owner exits.
+//! filter interrupts it. The capture thread stops waiting once no read has
+//! finished for the same 30 s, and leaves that thread to finish, or to fail
+//! when its owner exits.
 
 use std::{
     marker::PhantomData,
@@ -32,11 +33,20 @@ use windows::Win32::{
     },
 };
 
-/// Windows' own limit for a delayed render requested through GetClipboardData.
+/// Windows' own limit for one delayed render requested through GetClipboardData.
+/// The wait restarts whenever a read finishes, so a large copy that renders
+/// several slow formats is not mistaken for a frozen owner.
 const OWNER_TIMEOUT: Duration = Duration::from_secs(30);
 const WM_READER_JOB: u32 = WM_APP + 1;
 
 type Job = Box<dyn FnOnce() + Send>;
+/// Called on the reader thread each time a read finishes.
+type Progress = Box<dyn Fn()>;
+
+enum Event<T> {
+    Progress,
+    Done(T),
+}
 
 struct Worker {
     jobs: mpsc::Sender<Job>,
@@ -46,8 +56,8 @@ struct Worker {
 static WORKER: Mutex<Option<Worker>> = Mutex::new(None);
 
 pub(crate) enum ReadFailure {
-    /// The owner did not render within [`OWNER_TIMEOUT`]. Retrying would wait
-    /// that long again.
+    /// No read finished within [`OWNER_TIMEOUT`]. Retrying would wait that
+    /// long again.
     Unresponsive,
     Failed(String),
 }
@@ -60,8 +70,8 @@ pub(crate) fn with_reader<T: Send + 'static>(
     read: impl FnOnce(&Reader) -> T + Send + 'static,
 ) -> Result<(T, u32), ReadFailure> {
     on_reader_thread(
-        move || {
-            Reader::new().map(|reader| {
+        move |progress| {
+            Reader::new(progress).map(|reader| {
                 let value = read(&reader);
                 (value, unsafe { GetClipboardSequenceNumber() })
             })
@@ -72,12 +82,16 @@ pub(crate) fn with_reader<T: Send + 'static>(
 }
 
 fn on_reader_thread<T: Send + 'static>(
-    job: impl FnOnce() -> T + Send + 'static,
+    job: impl FnOnce(Progress) -> T + Send + 'static,
     timeout: Duration,
 ) -> Result<T, ReadFailure> {
-    let (done, result) = mpsc::sync_channel(1);
+    let (events, received) = mpsc::channel();
     let job: Job = Box::new(move || {
-        let _ = done.send(job());
+        let progress = events.clone();
+        let value = job(Box::new(move || {
+            let _ = progress.send(Event::Progress);
+        }));
+        let _ = events.send(Event::Done(value));
     });
     // Held for the whole read: reads are serialized, and an abandoned worker
     // is never handed another job.
@@ -103,17 +117,20 @@ fn on_reader_thread<T: Send + 'static>(
             "could not wake clipboard reader thread: {error}"
         )));
     }
-    match result.recv_timeout(timeout) {
-        Ok(value) => Ok(value),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            *worker = None;
-            Err(ReadFailure::Unresponsive)
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            *worker = None;
-            Err(ReadFailure::Failed(
-                "clipboard reader thread stopped".into(),
-            ))
+    loop {
+        match received.recv_timeout(timeout) {
+            Ok(Event::Done(value)) => return Ok(value),
+            Ok(Event::Progress) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                *worker = None;
+                return Err(ReadFailure::Unresponsive);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                *worker = None;
+                return Err(ReadFailure::Failed(
+                    "clipboard reader thread stopped".into(),
+                ));
+            }
         }
     }
 }
@@ -196,14 +213,16 @@ pub(crate) fn available(format: u32) -> bool {
 pub(crate) struct Reader {
     object: IDataObject,
     sequence: u32,
+    progress: Progress,
     _apartment: PhantomData<Rc<()>>,
 }
 impl Reader {
-    fn new() -> Result<Self, String> {
+    fn new(progress: Progress) -> Result<Self, String> {
         let sequence = unsafe { GetClipboardSequenceNumber() };
         Ok(Self {
             object: unsafe { OleGetClipboard() }.map_err(|e| e.to_string())?,
             sequence,
+            progress,
             _apartment: PhantomData,
         })
     }
@@ -214,7 +233,9 @@ impl Reader {
         if !available(format) {
             return Err("clipboard format unavailable".into());
         }
-        self.ole_bytes(format).or_else(|error| {
+        let read = self.ole_bytes(format);
+        (self.progress)();
+        read.or_else(|error| {
             // A live OLE source answers GetData itself and can fail a read
             // that GetClipboardData still serves, for example by rejecting
             // calls while busy. Retry the way the previous reader did, but only
@@ -224,8 +245,10 @@ impl Reader {
             if unsafe { GetClipboardSequenceNumber() } != self.sequence || !available(format) {
                 return Err(error);
             }
-            clipboard_win::get_clipboard::<Vec<u8>, _>(clipboard_win::formats::RawData(format))
-                .map_err(|fallback| format!("{error}; GetClipboardData: {fallback}"))
+            let read =
+                clipboard_win::get_clipboard::<Vec<u8>, _>(clipboard_win::formats::RawData(format));
+            (self.progress)();
+            read.map_err(|fallback| format!("{error}; GetClipboardData: {fallback}"))
         })
     }
 
@@ -290,7 +313,7 @@ mod tests {
     fn a_read_stuck_past_the_timeout_is_abandoned_for_a_fresh_reader_thread() {
         let (stuck_on, stuck_thread) = std::sync::mpsc::channel();
         let stuck = on_reader_thread(
-            move || {
+            move |_| {
                 let _ = stuck_on.send(std::thread::current().id());
                 std::thread::sleep(Duration::from_millis(500));
             },
@@ -300,16 +323,46 @@ mod tests {
         let stuck_thread = stuck_thread.recv().expect("the stuck read started");
         // That thread is still sleeping; only a new one can answer.
         let (thread, value) =
-            on_reader_thread(|| (std::thread::current().id(), 7), Duration::from_secs(5))
+            on_reader_thread(|_| (std::thread::current().id(), 7), Duration::from_secs(5))
                 .ok()
                 .expect("a fresh reader thread serves the next read");
         assert_eq!(value, 7);
         assert_ne!(thread, stuck_thread);
         let (again, _) =
-            on_reader_thread(|| (std::thread::current().id(), 0), Duration::from_secs(5))
+            on_reader_thread(|_| (std::thread::current().id(), 0), Duration::from_secs(5))
                 .ok()
                 .expect("the healthy reader thread is reused");
         assert_eq!(thread, again);
+    }
+
+    #[test]
+    fn reads_that_keep_finishing_are_not_mistaken_for_a_frozen_owner() {
+        // Eight slow formats take longer than the limit in total, but each one
+        // finishes well within it.
+        let finished = on_reader_thread(
+            |progress| {
+                for _ in 0..8 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    progress();
+                }
+                "all formats"
+            },
+            Duration::from_millis(250),
+        );
+        assert!(matches!(finished, Ok("all formats")));
+    }
+
+    #[test]
+    fn an_owner_that_stops_rendering_after_some_progress_still_times_out() {
+        let stalled = on_reader_thread(
+            |progress| {
+                progress();
+                progress();
+                std::thread::sleep(Duration::from_millis(500));
+            },
+            Duration::from_millis(50),
+        );
+        assert!(matches!(stalled, Err(ReadFailure::Unresponsive)));
     }
 
     #[test]

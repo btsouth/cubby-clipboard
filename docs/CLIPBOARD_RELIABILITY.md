@@ -200,9 +200,10 @@ Capture now follows these rules:
   sequence handled. Its own notification is still queued.
 - OLE reads run on a dedicated apartment thread. `GetData` into a frozen owner
   never returns, and on an STA neither `CoCancelCall` nor a message filter can
-  interrupt it. The capture thread waits at most 30 s, the same limit Windows
-  applies to `WM_RENDERFORMAT`, records that copy as not captured, and later
-  reads get a fresh thread.
+  interrupt it. The capture thread gives up once no read has finished for
+  30 s, the limit Windows applies to one `WM_RENDERFORMAT`, records that copy
+  as not captured, and later reads get a fresh thread. A large copy that
+  renders several slow formats keeps resetting that limit.
 - If an OLE read fails while the sequence is unchanged, retry that format with
   `GetClipboardData` as before. Never fall back once the sequence has moved.
 
