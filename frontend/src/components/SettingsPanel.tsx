@@ -1351,9 +1351,13 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
                 </div>
               )}
 
-              {activeTab === 'folders' && <FoldersTab />}
+              <div hidden={activeTab !== 'folders'}>
+                <FoldersTab />
+              </div>
 
-              {activeTab === 'about' && <AboutTab settings={settings} />}
+              <div hidden={activeTab !== 'about'}>
+                <AboutTab settings={settings} />
+              </div>
             </div>
           </div>
         </div>

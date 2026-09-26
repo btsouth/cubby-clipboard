@@ -194,6 +194,23 @@ describe('SettingsPanel Folders tab', () => {
     expect(screen.getByText('Work')).toBeInTheDocument();
     expect(invoke).not.toHaveBeenCalledWith('rename_folder', expect.anything());
   });
+
+  it('keeps unfinished folder edits when switching tabs', async () => {
+    renderPanel();
+    openTab('Folders');
+    const workRow = (await screen.findByText('Work')).closest('div') as HTMLElement;
+    const name = screen.getByPlaceholderText('New Folder Name');
+    fireEvent.change(name, { target: { value: 'Recipes' } });
+    fireEvent.click(within(workRow).getByTitle('Rename'));
+    fireEvent.change(screen.getByDisplayValue('Work'), { target: { value: 'Office' } });
+
+    openTab('About');
+    expect(name).not.toBeVisible();
+    openTab('Folders');
+    expect(name).toHaveValue('Recipes');
+    expect(screen.getByDisplayValue('Office')).toBeVisible();
+    expect(invoke).not.toHaveBeenCalledWith('rename_folder', expect.anything());
+  });
 });
 
 describe('SettingsPanel About tab', () => {
