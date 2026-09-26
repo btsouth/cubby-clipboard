@@ -11,7 +11,12 @@ import {
   findUnqualifiedRemoteHotkeyClaims,
   findWeakerFileRetentionClaim,
 } from './product-page-claims.mjs';
-import { extractDefaultSkipLikelySecrets, evaluateSecretHeuristicsDoc, saysDefaultOff } from './release-check-helpers.mjs';
+import {
+  extractDefaultSkipLikelySecrets,
+  evaluateSecretHeuristicsDoc,
+  readSettingsUiSource,
+  saysDefaultOff,
+} from './release-check-helpers.mjs';
 import {
   assertAllowlistNotWideOpen,
   extractAllowlistPatterns,
@@ -70,7 +75,7 @@ const [
   read('README.md'),
   read('product_pages/privacy.html'),
   read('product_pages/support.html'),
-  read('frontend/src/components/SettingsPanel.tsx'),
+  readSettingsUiSource(rootDir),
   read('.github/workflows/publish-store-packages.yml'),
   read('.github/workflows/validate-store-submission.yml'),
   read('scripts/verify-installer-signature.ps1'),
@@ -303,7 +308,7 @@ const userFacingHistoryDocs = [
   ['product_pages/start.html', startPageDoc],
   ['product_pages/terms.html', termsPageDoc],
   ['docs/press-kit/description.txt', pressKitDoc],
-  ['frontend/src/components/SettingsPanel.tsx', settingsPanelSource],
+  ['frontend/src/components/SettingsPanel.tsx and settings/*.tsx', settingsPanelSource],
 ];
 
 for (const [docName, doc] of userFacingHistoryDocs) {
