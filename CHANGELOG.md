@@ -4,9 +4,16 @@ All notable Cubby Clipboard changes are documented here. PastePaw entries below 
 
 ## Unreleased
 
+## v1.3.4
+
 ### Fixed
-- Image recapture no longer truncates a destination-gone staging file that is the only remaining original; staging refuses to overwrite it (SBS-1073)
-- Image pastes from Cubby, ignored-app copies, and consecutive duplicate images no longer decode a full PNG thumbnail that is then discarded (SBS-1077)
+- Excel copies are less likely to show a clipboard warning or leave the first paste empty. Cubby now avoids Excel's clipboard publish gap and reads copied data through OLE.
+- Fast successive copies are kept when a new copy arrives just after a read finishes. Capture also resumes after a clipboard owner stops responding for 30 seconds.
+- Image recapture no longer overwrites the only remaining original when its destination disappears (SBS-1073).
+- Image pastes and ignored or duplicate images avoid an unnecessary full thumbnail decode (SBS-1077).
+
+### Security
+- Updated rustls past RUSTSEC-2026-0285.
 
 ## v1.3.3
 
