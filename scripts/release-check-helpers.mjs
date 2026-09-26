@@ -3,6 +3,29 @@
 // release-check script, which reads live repo files (and checks today's
 // date) as soon as it's imported.
 
+import { readdir, readFile } from 'node:fs/promises';
+import path from 'node:path';
+
+/**
+ * The Settings UI is SettingsPanel.tsx plus one component per tab under
+ * components/settings/. Copy and link checks run over all of it, so moving a
+ * row into a tab file cannot take it out of the release check.
+ */
+export async function readSettingsUiSource(repoRoot) {
+  const componentsDir = path.join(repoRoot, 'frontend', 'src', 'components');
+  const tabDir = path.join(componentsDir, 'settings');
+  const tabFiles = (await readdir(tabDir))
+    .filter((name) => name.endsWith('.tsx') && !name.endsWith('.test.tsx'))
+    .sort()
+    .map((name) => path.join(tabDir, name));
+  const sources = await Promise.all(
+    [path.join(componentsDir, 'SettingsPanel.tsx'), ...tabFiles].map((file) =>
+      readFile(file, 'utf8')
+    )
+  );
+  return sources.join('\n');
+}
+
 /**
  * Strip Rust line and block comments so a stale commented-out assignment
  * (e.g. `// skip_likely_secrets: false,`) can never be mistaken for the live

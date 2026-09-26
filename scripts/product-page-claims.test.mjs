@@ -12,6 +12,7 @@ import {
   findUnqualifiedRemoteHotkeyClaims,
   findWeakerFileRetentionClaim,
 } from './product-page-claims.mjs';
+import { readSettingsUiSource } from './release-check-helpers.mjs';
 
 test('a positive support claim is reported', () => {
   const claims = findFileListHistoryClaims(
@@ -417,13 +418,9 @@ test('remote paste and tray fallback copy are not remote-hotkey claims', () => {
 
 test('live Settings and support copy name the Win+V replacement dependency', async () => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  for (const relative of [
-    'frontend/src/components/SettingsPanel.tsx',
-    'product_pages/support.html',
-  ]) {
-    const source = await readFile(path.join(root, relative), 'utf8');
-    assert.deepEqual(findUnqualifiedRemoteHotkeyClaims(source), [], relative);
-  }
+  assert.deepEqual(findUnqualifiedRemoteHotkeyClaims(await readSettingsUiSource(root)), [], 'Settings');
+  const support = await readFile(path.join(root, 'product_pages/support.html'), 'utf8');
+  assert.deepEqual(findUnqualifiedRemoteHotkeyClaims(support), [], 'product_pages/support.html');
 });
 
 // SBS-1071: after SBS-1001, skip_sensitive and skip_likely_secrets return
@@ -495,15 +492,11 @@ test('an unrelated do-not-stop sentence is not reported', () => {
 
 test('live privacy.html and Settings copy do not claim relay bypasses skip gates', async () => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  for (const relative of [
-    'product_pages/privacy.html',
-    'frontend/src/components/SettingsPanel.tsx',
-  ]) {
-    const source = await readFile(path.join(root, relative), 'utf8');
-    assert.deepEqual(
-      findStaleRemoteRelayPrivacyBypassClaims(source),
-      [],
-      relative
-    );
-  }
+  const privacy = await readFile(path.join(root, 'product_pages/privacy.html'), 'utf8');
+  assert.deepEqual(findStaleRemoteRelayPrivacyBypassClaims(privacy), [], 'product_pages/privacy.html');
+  assert.deepEqual(
+    findStaleRemoteRelayPrivacyBypassClaims(await readSettingsUiSource(root)),
+    [],
+    'Settings'
+  );
 });

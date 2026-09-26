@@ -1,4 +1,4 @@
-import { Settings, FolderItem } from '../types';
+import { Settings } from '../types';
 import {
   X,
   Trash2,
@@ -6,15 +6,11 @@ import {
   FolderOpen,
   Settings as SettingsIcon,
   Folder as FolderIcon,
-  MoreHorizontal,
   Pause,
   Play,
   RefreshCw,
   ShieldCheck,
   Info,
-  Github,
-  Globe,
-  ExternalLink,
   Lock,
   AlertTriangle,
   FlaskConical,
@@ -25,13 +21,21 @@ import { useModalDialog } from '../hooks/useModalDialog';
 import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { getVersion } from '@tauri-apps/api/app';
-import { openUrl } from '@tauri-apps/plugin-opener';
-import { check } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from 'sonner';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Select } from './ui/Select';
+import { AboutTab } from './settings/AboutTab';
+import { FoldersTab } from './settings/FoldersTab';
+import {
+  CubbyMark,
+  PaneHeader,
+  Row,
+  SectionLabel,
+  Segmented,
+  SettingCard,
+  Toggle,
+  ghostButton,
+} from './settings/ui';
 import { useShortcutRecorder } from 'use-shortcut-recorder';
 import { clsx } from 'clsx';
 
@@ -41,11 +45,6 @@ interface SettingsPanelProps {
 }
 
 type Tab = 'general' | 'privacy' | 'folders' | 'about';
-
-const GITHUB_URL = 'https://github.com/btsouth/cubby-clipboard';
-const WEBSITE_URL = 'https://cubbyclipboard.com';
-const PRIVACY_URL = 'https://cubbyclipboard.com/privacy';
-
 type BackupImportResult = {
   total: number;
   imported: number;
@@ -94,155 +93,12 @@ function formatBytes(bytes: number): string {
   return `${(mb / 1024).toFixed(1)} GB`;
 }
 
-function CubbyMark({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
-      <path
-        fill="#147ee8"
-        d="M14 2h34c7.7 0 14 6.3 14 14v5H32c-6.6 0-12 5.4-12 12s5.4 12 12 12h30v3c0 7.7-6.3 14-14 14H14C6.3 62 0 55.7 0 48V16C0 8.3 6.3 2 14 2Z"
-      />
-      <rect x="42" y="25" width="20" height="16" rx="8" fill="#32aeb1" />
-    </svg>
-  );
-}
-
-function PaneHeader({ title, subtitle }: { title: string; subtitle: string }) {
-  return (
-    <div>
-      <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
-      <p className="mt-1 text-[13px] text-muted-foreground">{subtitle}</p>
-    </div>
-  );
-}
-
-function SectionLabel({ children }: { children: ReactNode }) {
-  return (
-    <p className="mb-2 ml-1 text-[11px] font-semibold uppercase tracking-[0.09em] text-muted-foreground">
-      {children}
-    </p>
-  );
-}
-
-function SettingCard({ children }: { children: ReactNode }) {
-  return (
-    <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
-      {children}
-    </div>
-  );
-}
-
-function Row({
-  title,
-  desc,
-  control,
-  children,
-}: {
-  title?: ReactNode;
-  desc?: ReactNode;
-  control?: ReactNode;
-  children?: ReactNode;
-}) {
-  if (children) {
-    return (
-      <div className="px-4 py-3.5">
-        {(title || desc) && (
-          <div className="mb-3">
-            {title && <div className="text-sm font-medium">{title}</div>}
-            {desc && <p className="mt-0.5 text-xs leading-snug text-muted-foreground">{desc}</p>}
-          </div>
-        )}
-        {children}
-      </div>
-    );
-  }
-  return (
-    <div className="flex items-center gap-4 px-4 py-3.5">
-      <div className="min-w-0 flex-1">
-        {title && <div className="text-sm font-medium">{title}</div>}
-        {desc && <p className="mt-0.5 text-xs leading-snug text-muted-foreground">{desc}</p>}
-      </div>
-      {control && <div className="flex-shrink-0">{control}</div>}
-    </div>
-  );
-}
-
-function Toggle({
-  checked,
-  onChange,
-  disabled,
-  label,
-}: {
-  checked: boolean;
-  onChange: () => void;
-  disabled?: boolean;
-  label?: string;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={onChange}
-      className={clsx(
-        'relative h-6 w-11 flex-shrink-0 rounded-full transition-colors',
-        checked ? 'bg-primary' : 'bg-accent',
-        disabled && 'cursor-not-allowed opacity-40'
-      )}
-    >
-      <span
-        className={clsx(
-          'absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform',
-          checked ? 'translate-x-5' : 'translate-x-0'
-        )}
-      />
-    </button>
-  );
-}
-
-function Segmented({
-  value,
-  onChange,
-  options,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  options: { value: string; label: string }[];
-}) {
-  return (
-    <div className="inline-flex gap-0.5 rounded-lg border border-border bg-accent/40 p-0.5">
-      {options.map((option) => (
-        <button
-          key={option.value}
-          type="button"
-          onClick={() => onChange(option.value)}
-          className={clsx(
-            'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
-            value === option.value
-              ? 'bg-primary text-primary-foreground'
-              : 'text-muted-foreground hover:text-foreground'
-          )}
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>('general');
   const [settings, setSettings] = useState<Settings>(initialSettings);
   const settingsRef = useRef<Settings>(initialSettings);
   const settingsSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const [isRecordingMode, setIsRecordingMode] = useState(false);
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  // Folder Management State
-  const [folders, setFolders] = useState<FolderItem[]>([]);
-  const [newFolderName, setNewFolderName] = useState('');
-  const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState('');
 
   // Apply theme immediately when settings.theme changes
   useTheme(settings.theme);
@@ -319,7 +175,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
 
   const [ignoredApps, setIgnoredApps] = useState<string[]>([]);
   const [newIgnoredApp, setNewIgnoredApp] = useState('');
-  const [appVersion, setAppVersion] = useState('');
   const [dittoBusy, setDittoBusy] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
   // Which passphrase prompt is open, if any.
@@ -352,15 +207,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
     action: async () => {},
   });
 
-  const loadFolders = async () => {
-    try {
-      const data = await invoke<FolderItem[]>('get_folders');
-      setFolders(data);
-    } catch (error) {
-      console.error('Failed to load folders:', error);
-    }
-  };
-
   const loadOcrStatus = async () => {
     try {
       setOcrStatus(await invoke<OcrQueueStatus>('get_ocr_queue_status'));
@@ -379,8 +225,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
 
   useEffect(() => {
     invoke<string[]>('get_ignored_apps').then(setIgnoredApps).catch(console.error);
-    getVersion().then(setAppVersion).catch(console.error);
-    loadFolders();
     loadOcrStatus();
     loadStorageUsage();
     const ocrStatusTimer = window.setInterval(loadOcrStatus, 3000);
@@ -441,51 +285,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
       toast.error(String(error));
     } finally {
       setOcrActionBusy(false);
-    }
-  };
-
-  // A URL missing from the opener allowlist rejects at the Tauri boundary with
-  // no visible effect, so a swallowed console.error looked exactly like a dead
-  // button. Say so instead: the user can still reach the page in a browser.
-  const handleOpenUrl = (url: string) => {
-    openUrl(url).catch((error) => {
-      console.error(`Could not open ${url}:`, error);
-      toast.error(`Could not open ${url} in your browser.`);
-    });
-  };
-
-  const handleCheckUpdates = async () => {
-    setCheckingUpdate(true);
-    try {
-      const update = await check();
-      if (update?.available) {
-        toast(`Cubby ${update.version} is available.`, {
-          duration: Infinity,
-          action: {
-            label: 'Update now',
-            onClick: () => {
-              const toastId = toast.loading('Downloading update…');
-              update
-                .downloadAndInstall()
-                .then(() => {
-                  toast.success('Update ready — restarting Cubby…', { id: toastId });
-                  return relaunch();
-                })
-                .catch((error) => {
-                  console.error('Update install failed:', error);
-                  toast.error('Update failed. Please try again later.', { id: toastId });
-                });
-            },
-          },
-        });
-      } else {
-        toast.success("You're on the latest version.");
-      }
-    } catch (error) {
-      console.error('Update check failed:', error);
-      toast.error('Update failed. Please try again later.');
-    } finally {
-      setCheckingUpdate(false);
     }
   };
 
@@ -719,47 +518,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
     });
   };
 
-  // Folder Management Functions
-  const handleCreateFolder = async () => {
-    if (!newFolderName.trim()) return;
-    try {
-      await invoke('create_folder', { name: newFolderName.trim(), icon: null, color: null });
-      setNewFolderName('');
-      await loadFolders();
-      toast.success('Folder created');
-    } catch (e) {
-      toast.error(`Failed to create folder: ${e}`);
-    }
-  };
-
-  const handleDeleteFolder = async (id: string) => {
-    try {
-      await invoke('delete_folder', { id });
-      await loadFolders();
-      toast.success('Folder deleted');
-    } catch (e) {
-      toast.error(`Failed to delete folder: ${e}`);
-    }
-  };
-
-  const startRenameFolder = (folder: FolderItem) => {
-    setEditingFolderId(folder.id);
-    setRenameValue(folder.name);
-  };
-
-  const saveRenameFolder = async () => {
-    if (!editingFolderId || !renameValue.trim()) return;
-    try {
-      await invoke('rename_folder', { id: editingFolderId, name: renameValue.trim() });
-      setEditingFolderId(null);
-      setRenameValue('');
-      await loadFolders();
-      toast.success('Folder renamed');
-    } catch (e) {
-      toast.error(`Failed to rename folder: ${e}`);
-    }
-  };
-
   // Format shortcut array into Tauri-compatible string
   const formatHotkey = (keys: string[]): string => {
     return keys
@@ -796,8 +554,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
       : settings.mica_effect === 'mica_alt' || settings.mica_effect === 'auto'
         ? 'acrylic'
         : settings.mica_effect || 'solid';
-
-  const customFolders = folders.filter((folder) => !folder.is_system);
 
   const tabs: { id: Tab; label: string; icon: ReactNode }[] = [
     { id: 'general', label: 'General', icon: <SettingsIcon size={17} /> },
@@ -839,10 +595,6 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
         break;
     }
   };
-
-  const ghostButton =
-    'inline-flex items-center gap-2 rounded-lg border border-border bg-accent/40 px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-50';
-
   return (
     <>
       <ConfirmDialog
@@ -1599,190 +1351,9 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
                 </div>
               )}
 
-              {/* --- FOLDERS TAB --- */}
-              {activeTab === 'folders' && (
-                <div className="space-y-7">
-                  <PaneHeader
-                    title={'Folders'}
-                    subtitle={'Group pinned clips into folders you can jump to.'}
-                  />
-                  <section>
-                    <SectionLabel>{'Manage Folders'}</SectionLabel>
-                    <SettingCard>
-                      <div className="p-2">
-                        {customFolders.length === 0 ? (
-                          <p className="px-2 py-3 text-center text-xs text-muted-foreground">
-                            {'No custom folders created.'}
-                          </p>
-                        ) : (
-                          <div className="space-y-0.5">
-                            {customFolders.map((folder) => (
-                              <div
-                                key={folder.id}
-                                className="group flex items-center gap-3 rounded-lg px-2.5 py-2 hover:bg-accent/50"
-                              >
-                                {editingFolderId === folder.id ? (
-                                  <div className="flex flex-1 items-center gap-2">
-                                    <input
-                                      type="text"
-                                      value={renameValue}
-                                      onChange={(e) => setRenameValue(e.target.value)}
-                                      className="flex-1 rounded-md border border-input bg-background px-2 py-1 text-sm"
-                                      autoFocus
-                                      onKeyDown={(e) => {
-                                        if (e.key === 'Enter') saveRenameFolder();
-                                        if (e.key === 'Escape') setEditingFolderId(null);
-                                      }}
-                                    />
-                                    <button
-                                      onClick={saveRenameFolder}
-                                      className="text-xs text-primary hover:underline"
-                                    >
-                                      {'Save'}
-                                    </button>
-                                    <button
-                                      onClick={() => setEditingFolderId(null)}
-                                      className="text-xs text-muted-foreground hover:underline"
-                                    >
-                                      {'Cancel'}
-                                    </button>
-                                  </div>
-                                ) : (
-                                  <>
-                                    <span className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md border border-border bg-accent/40 text-primary">
-                                      <FolderIcon size={14} />
-                                    </span>
-                                    <span className="flex-1 text-sm font-medium">
-                                      {folder.name}
-                                      <span className="ml-2 text-xs font-normal text-muted-foreground">
-                                        {`${folder.item_count} items`}
-                                      </span>
-                                    </span>
-                                    <button
-                                      onClick={() => startRenameFolder(folder)}
-                                      className="rounded-md p-1 text-muted-foreground opacity-0 transition hover:bg-accent hover:text-foreground group-hover:opacity-100"
-                                      title="Rename"
-                                    >
-                                      <MoreHorizontal size={14} />
-                                    </button>
-                                    <button
-                                      onClick={() => handleDeleteFolder(folder.id)}
-                                      className="rounded-md p-1 text-muted-foreground opacity-0 transition hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
-                                      title="Delete"
-                                    >
-                                      <Trash2 size={14} />
-                                    </button>
-                                  </>
-                                )}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex gap-2 px-3 py-3">
-                        <input
-                          type="text"
-                          value={newFolderName}
-                          onChange={(e) => setNewFolderName(e.target.value)}
-                          placeholder={'New Folder Name'}
-                          className="flex-1 rounded-lg border border-border bg-input px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                          onKeyDown={(e) => e.key === 'Enter' && handleCreateFolder()}
-                        />
-                        <button
-                          onClick={handleCreateFolder}
-                          disabled={!newFolderName.trim()}
-                          className={ghostButton}
-                        >
-                          <Plus size={14} />
-                          {'Add'}
-                        </button>
-                      </div>
-                    </SettingCard>
-                  </section>
-                </div>
-              )}
+              {activeTab === 'folders' && <FoldersTab />}
 
-              {/* --- ABOUT TAB --- */}
-              {activeTab === 'about' && (
-                <div className="space-y-7">
-                  <PaneHeader
-                    title={'About'}
-                    subtitle={'Version, updates, and the open-source project.'}
-                  />
-                  <section>
-                    <SettingCard>
-                      <div className="flex items-center gap-4 px-4 py-4">
-                        <CubbyMark className="h-11 w-11 flex-shrink-0" />
-                        <div className="min-w-0 flex-1">
-                          <div className="text-base font-semibold">Cubby</div>
-                          <div className="text-xs text-muted-foreground">
-                            {`Version ${appVersion || '…'}`}
-                          </div>
-                        </div>
-                        {settings.self_update_available !== false && (
-                          <button
-                            onClick={handleCheckUpdates}
-                            disabled={checkingUpdate}
-                            className={ghostButton}
-                          >
-                            <RefreshCw size={14} className={checkingUpdate ? 'animate-spin' : ''} />
-                            {'Check for updates'}
-                          </button>
-                        )}
-                      </div>
-                      {/* Portable builds have no self-update: it installs an
-                          NSIS package, which would split the app from the data
-                          folder the user carries with it. Say how to upgrade by
-                          hand instead of leaving a version number and no path
-                          forward. Store builds need nothing here — Windows
-                          updates them. */}
-                      {settings.self_update_available === false && settings.is_portable && (
-                        <div className="flex gap-3 px-4 py-3.5">
-                          <Info size={16} className="mt-0.5 flex-shrink-0 text-muted-foreground" />
-                          <p className="text-xs leading-relaxed text-muted-foreground">
-                            {
-                              "The portable version does not update itself. To upgrade, download the newest portable ZIP and replace Cubby Clipboard.exe. Keep the 'data' folder and portable.txt next to it and your history, settings, and folders carry over."
-                            }
-                          </p>
-                        </div>
-                      )}
-                      <button
-                        onClick={() => handleOpenUrl(GITHUB_URL)}
-                        className="flex w-full items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-accent/40"
-                      >
-                        <Github size={16} className="text-muted-foreground" />
-                        <span className="flex-1 text-left">{'Source code on GitHub'}</span>
-                        <ExternalLink size={14} className="text-muted-foreground" />
-                      </button>
-                      <button
-                        onClick={() => handleOpenUrl(WEBSITE_URL)}
-                        className="flex w-full items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-accent/40"
-                      >
-                        <Globe size={16} className="text-muted-foreground" />
-                        <span className="flex-1 text-left">cubbyclipboard.com</span>
-                        <ExternalLink size={14} className="text-muted-foreground" />
-                      </button>
-                      <button
-                        onClick={() => handleOpenUrl(PRIVACY_URL)}
-                        className="flex w-full items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-accent/40"
-                      >
-                        <ShieldCheck size={16} className="text-muted-foreground" />
-                        <span className="flex-1 text-left">{'Privacy policy'}</span>
-                        <ExternalLink size={14} className="text-muted-foreground" />
-                      </button>
-                    </SettingCard>
-                    <div className="mt-3 flex gap-3 rounded-xl border border-border bg-card/60 p-3.5">
-                      <Info size={16} className="mt-0.5 flex-shrink-0 text-muted-foreground" />
-                      <p className="text-xs leading-relaxed text-muted-foreground">
-                        <span className="font-semibold text-foreground">
-                          {'Free and open source.'}
-                        </span>{' '}
-                        {'Cubby is GPL-3.0, a fork of PastePaw. © 2026 SouthForge AI.'}
-                      </p>
-                    </div>
-                  </section>
-                </div>
-              )}
+              {activeTab === 'about' && <AboutTab settings={settings} />}
             </div>
           </div>
         </div>
