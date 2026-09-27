@@ -213,6 +213,38 @@ describe('SettingsPanel Folders tab', () => {
   });
 });
 
+describe('SettingsPanel Privacy tab', () => {
+  it('keeps an unfinished ignored-app entry across tab switches', () => {
+    renderPanel();
+    openTab('Privacy');
+    const input = screen.getByRole('textbox', { name: 'Executable to ignore' });
+    fireEvent.change(input, { target: { value: 'notepad.exe' } });
+
+    openTab('About');
+    expect(input).not.toBeVisible();
+    openTab('Privacy');
+    expect(input).toHaveValue('notepad.exe');
+  });
+
+  it('keeps retention and General changes in the same save queue', async () => {
+    renderPanel();
+    openTab('Privacy');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Keep history for' }), {
+      target: { value: '90' },
+    });
+    openTab('General');
+    fireEvent.click(screen.getByRole('switch', { name: 'Rounded Corners' }));
+
+    await waitFor(() => expect(saves).toHaveLength(1));
+    expect(saves[0].changedKeys).toEqual(['auto_delete_days', 'max_items']);
+    await act(async () => releaseFirstSave?.());
+    await waitFor(() => expect(saves).toHaveLength(2));
+    expect(saves[1].settings.auto_delete_days).toBe(90);
+    expect(saves[1].settings.round_corners).toBe(true);
+    expect(invoke).toHaveBeenCalledWith('apply_retention');
+  });
+});
+
 describe('SettingsPanel About tab', () => {
   it('shows the app version and opens project links', async () => {
     vi.mocked(openUrl).mockResolvedValue(undefined);
