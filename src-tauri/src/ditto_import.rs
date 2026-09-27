@@ -720,6 +720,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(target_os = "windows")]
     fn tiny_dib() -> Vec<u8> {
         let mut dib = Vec::new();
         dib.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER size
@@ -814,6 +815,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn imports_text_clips_with_dates_pins_and_dedup() {
         use crate::crypto::CryptoManager;
