@@ -505,10 +505,10 @@ pub async fn import_from_ditto(
         let mut malformed = false;
         for data_row in data_rows {
             match (
-                data_row.try_get::<String, _>("strClipBoardFormat"),
-                data_row.try_get::<Vec<u8>, _>("ooData"),
+                data_row.try_get::<Option<String>, _>("strClipBoardFormat"),
+                data_row.try_get::<Option<Vec<u8>>, _>("ooData"),
             ) {
-                (Ok(name), Ok(data)) if !name.is_empty() => formats.push((name, data)),
+                (Ok(Some(name)), Ok(Some(data))) if !name.is_empty() => formats.push((name, data)),
                 _ => {
                     malformed = true;
                     break;
