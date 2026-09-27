@@ -140,3 +140,29 @@ The assistive-technology half of this document is still unrun, and that is what
 issue #45 needs next. The listbox change in finding 1 is the item most worth
 confirming with Narrator, since `aria-activedescendant` is exactly the kind of
 thing that reads correctly in the DOM and still fails in practice.
+
+### 2026-09-26: bounded Windows VM check
+
+Windows 11 25H2, build 26200.8037; installed Cubby 1.3.4; 1280×800 display
+at 100% scaling (system DPI 96). Text scaling was not measured. The VM had
+only throwaway clipboard fixtures on screen.
+
+Observed:
+
+- The tray icon opened the flyout. Arrow Down moved the visible selection from
+  the first clip to the second.
+- In Settings, End moved the selected tab to About with a visible focus ring.
+  Tab then moved focus into the content pane and to Check for updates, again
+  with visible focus.
+- Escape dismissed the flyout while leaving the separate Settings window open.
+- The signed `5a41a50` portable candidate displayed all four Settings tabs in
+  light and dark themes. An unfinished ignored-app entry survived tab switches;
+  a General and a Privacy change both persisted after restart. These are
+  functional checks, not Narrator results.
+
+No product defect was confirmed in this bounded check. Narrator speech and
+selection announcements, the configured hotkey through noVNC, keyboard access
+to the context menu, modal focus restoration, 150% and 200% display scaling,
+200% text scaling, high-contrast themes, and reduced-motion behavior remain
+unverified. The VM's noVNC view does not expose Narrator speech, so this result
+must not be treated as a completed assistive-technology pass.
