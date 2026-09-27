@@ -3210,11 +3210,13 @@ pub fn get_system_accent_color() -> Result<serde_json::Value, String> {
 pub async fn import_from_ditto(
     db_path: String,
     dry_run: bool,
+    app: AppHandle,
     db: tauri::State<'_, Arc<Database>>,
 ) -> Result<crate::ditto_import::DittoImportResult, String> {
     let result = crate::path_grant::import_granted_ditto(&db, db_path, dry_run).await?;
     if !dry_run && result.imported > 0 {
         db.search_index.invalidate();
+        let _ = app.emit("clipboard-change", ());
     }
     Ok(result)
 }
