@@ -37,7 +37,7 @@ fn is_image_format(format: &str) -> bool {
 
 /// Ditto's `CF_UNICODETEXT` blob is UTF-16LE, usually NUL-terminated.
 fn decode_utf16le(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
     let units: Vec<u16> = bytes
@@ -205,6 +205,12 @@ struct ImportedImage {
     height: u32,
 }
 
+struct DittoClipMeta {
+    lid: i64,
+    ldate: i64,
+    pinned: bool,
+}
+
 /// Registered PNG is already the representation native capture would store.
 /// A bitmap is decoded by the same DIB parser used for clipboard capture.
 fn extract_image(formats: &[(String, Vec<u8>)]) -> Option<Result<ImportedImage, String>> {
@@ -275,13 +281,12 @@ fn unix_to_datetime(seconds: i64) -> String {
 async fn import_image_clip(
     db: &Database,
     image: ImportedImage,
-    lid: i64,
-    ldate: i64,
-    pinned: bool,
+    clip: DittoClipMeta,
     dry_run: bool,
     planned: &mut std::collections::HashSet<String>,
     result: &mut DittoImportResult,
 ) {
+    let DittoClipMeta { lid, ldate, pinned } = clip;
     let material = build_clip_hash_material("image", &image.png, std::iter::empty());
     let content_hash = db.crypto.keyed_hash(&material);
     let existing: Option<String> =
@@ -526,9 +531,11 @@ pub async fn import_from_ditto(
                     import_image_clip(
                         db,
                         image,
-                        lid,
-                        ldate,
-                        dont_delete != 0,
+                        DittoClipMeta {
+                            lid,
+                            ldate,
+                            pinned: dont_delete != 0,
+                        },
                         dry_run,
                         &mut planned,
                         &mut result,
