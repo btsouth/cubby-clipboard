@@ -1489,7 +1489,9 @@ fn read_clipboard_image(
 /// Supply an explicit BMP pixel offset for these packed DIBs. Keep the existing
 /// decoder/encoder for pixel and hash compatibility, without discarding alpha.
 #[cfg(target_os = "windows")]
-fn decode_clipboard_dib(mut bytes: Vec<u8>) -> Result<image_capture::DynamicImage, String> {
+pub(crate) fn decode_clipboard_dib(
+    mut bytes: Vec<u8>,
+) -> Result<image_capture::DynamicImage, String> {
     use std::io::Cursor;
     let dword = |offset| {
         bytes
