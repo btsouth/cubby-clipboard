@@ -4,6 +4,15 @@ All notable Cubby Clipboard changes are documented here. PastePaw entries below 
 
 ## Unreleased
 
+## v1.3.5
+
+### Added
+- Ditto import now brings over PNG and DIB images plus HTML and RTF formatting. Imported content stays encrypted in Cubby.
+
+### Fixed
+- Ditto text import uses the saved Windows locale for ANSI and OEM text when available, and reports skipped malformed or unsupported rows.
+- Imported clips now appear in the open flyout and History without restarting Cubby.
+
 ## v1.3.4
 
 ### Fixed
