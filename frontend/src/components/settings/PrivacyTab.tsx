@@ -42,9 +42,16 @@ type DittoImportResult = {
   skipped_groups: number;
   skipped_images: number;
   skipped_empty: number;
+  skipped_malformed: number;
   errors: string[];
   dry_run: boolean;
 };
+
+function dittoSkipped(result: DittoImportResult): number {
+  return (
+    result.skipped_groups + result.skipped_images + result.skipped_empty + result.skipped_malformed
+  );
+}
 
 type OcrQueueStatus = {
   pending: number;
@@ -204,18 +211,23 @@ export function PrivacyTab({ settings, updateSetting, onRetentionChange }: Priva
     }
 
     if (preview.imported === 0) {
-      toast.info(
-        preview.duplicates > 0
-          ? 'Everything in that Ditto database is already in Cubby.'
-          : 'No importable clips were found in that Ditto database.'
-      );
+      const skipped = dittoSkipped(preview);
+      if (skipped > 0) {
+        toast.info(`No clips to import from Ditto; ${skipped} skipped.`);
+      } else {
+        toast.info(
+          preview.duplicates > 0
+            ? 'Everything in that Ditto database is already in Cubby.'
+            : 'No importable clips were found in that Ditto database.'
+        );
+      }
       return;
     }
 
     setConfirmDialog({
       isOpen: true,
       title: 'Import from Ditto',
-      message: `Import ${preview.imported} clips from Ditto? Items already in Cubby are skipped.`,
+      message: `Import ${preview.imported} clips from Ditto? ${preview.duplicates} duplicates and ${dittoSkipped(preview)} unsupported or malformed rows will be skipped.`,
       action: async () => {
         setDittoBusy(true);
         try {
@@ -223,12 +235,11 @@ export function PrivacyTab({ settings, updateSetting, onRetentionChange }: Priva
             dbPath,
             dryRun: false,
           });
+          const summary = `Imported ${result.imported} clips from Ditto; ${dittoSkipped(result)} skipped`;
           if (result.errors.length > 0) {
-            toast.warning(
-              `Imported ${result.imported} clips from Ditto; ${result.errors.length} could not be imported`
-            );
+            toast.warning(`${summary}; ${result.errors.length} errors`);
           } else {
-            toast.success(`Imported ${result.imported} clips from Ditto`);
+            toast.success(summary);
           }
         } catch (e) {
           toast.error(`Ditto import failed: ${String(e)}`);
