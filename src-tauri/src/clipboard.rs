@@ -1106,6 +1106,9 @@ fn capture_one_bound_sequence(
                 return Ok(CaptureAttempt::Deferred);
             }
         }
+        // A sequence may represent many RDP copies. Count consecutive failed
+        // reads, not unrelated contention episodes across successful samples.
+        reset_capture_deferrals(&DEFERRED_SEQUENCE, &DEFERRED_ATTEMPTS, sequence);
         if let CaptureTrigger::RdpTextPoll(owner) = trigger {
             if !matches!(&content, CapturedContent::Text { .. })
                 || !rdp_owner
@@ -1217,6 +1220,12 @@ fn capture_one_bound_sequence(
         sequence
     );
     Ok(CaptureAttempt::Handled)
+}
+
+#[cfg(target_os = "windows")]
+fn reset_capture_deferrals(sequence: &AtomicU32, attempts: &AtomicU32, current: u32) {
+    sequence.store(current, Ordering::SeqCst);
+    attempts.store(0, Ordering::SeqCst);
 }
 
 #[cfg(target_os = "windows")]
@@ -3958,6 +3967,30 @@ pub use capture_probe::run_capture_probe;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn successful_same_sequence_samples_reset_separate_contention_episodes() {
+        use super::{
+            deferral_decision, reset_capture_deferrals, CaptureAttempt, MAX_DEFERRALS_PER_SEQUENCE,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let sequence = AtomicU32::new(7);
+        let attempts = AtomicU32::new(0);
+        for _ in 0..100 {
+            let (count, decision) = deferral_decision(
+                sequence.load(Ordering::SeqCst),
+                attempts.load(Ordering::SeqCst),
+                7,
+                MAX_DEFERRALS_PER_SEQUENCE,
+            );
+            attempts.store(count, Ordering::SeqCst);
+            assert_eq!(decision, CaptureAttempt::Deferred);
+            // Both a changed coherent sample and an unchanged deduplicated
+            // sample must reset the retry budget before the next failure.
+            reset_capture_deferrals(&sequence, &attempts, 7);
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn temporary_privacy_read_contention_recovers_without_exhausting_rdp_sampling() {
