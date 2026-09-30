@@ -1245,13 +1245,15 @@ fn run_listener_session(
     let mut poll_owner = None;
     let mut timed_out_sequence = None;
     loop {
+        // try_recv discards shutdown messages. Check this even after ownership
+        // changed back to a local application, before blocking in recv again.
+        if LISTENER_SHUTDOWN.lock().is_none() {
+            return ListenerSessionExit::RestartRequested;
+        }
         let notification = if poll_owner.is_some() {
             // try_recv ignores the monitor's shutdown message. The supervisor
             // clears this slot before dropping its shutdown handle, so retain
             // the watchdog's restart signal even while sampling RDP text.
-            if LISTENER_SHUTDOWN.lock().is_none() {
-                return ListenerSessionExit::RestartRequested;
-            }
             match monitor.try_recv() {
                 Ok(received) => received,
                 Err(error) => return ListenerSessionExit::Failed(error.to_string()),
@@ -3803,6 +3805,33 @@ pub use capture_probe::run_capture_probe;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_shutdown_consumed_by_nonblocking_monitor_still_restarts_before_a_blocking_read() {
+        use super::{run_listener_session, snapshot_channel, ListenerSessionExit};
+        let (ready, abort) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut monitor = clipboard_win::Monitor::new().expect("create test monitor");
+            // Simulate leaving RDP sampling after try_recv discarded shutdown.
+            drop(monitor.shutdown_channel());
+            while monitor.try_recv().expect("drain clipboard messages") {}
+            ready.send(monitor.shutdown_channel()).unwrap();
+            let (events, _receiver) = snapshot_channel::channel();
+            let exit = run_listener_session(&mut monitor, &events, &mut None);
+            let _ = done.send(exit);
+        });
+        let abort = abort
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor ready");
+        let exit = result.recv_timeout(Duration::from_secs(5));
+        // Also unblock the old implementation on a regression, so failure does
+        // not leave a thread waiting forever or require weakening the check.
+        drop(abort);
+        worker.join().expect("monitor thread exited");
+        assert!(matches!(exit, Ok(ListenerSessionExit::RestartRequested)));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn rdp_samples_retain_changed_text_even_when_sequence_and_owner_never_advance() {
