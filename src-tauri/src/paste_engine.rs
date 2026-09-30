@@ -108,26 +108,11 @@ fn process_name_for_window(hwnd: isize) -> Option<String> {
 }
 
 pub fn paste_strategy_for_process(process_name: &str) -> PasteStrategy {
-    if process_name.eq_ignore_ascii_case("ncplayer.exe") {
-        return PasteStrategy::NinjaRemote;
-    }
-
-    if matches!(
-        process_name.to_ascii_lowercase().as_str(),
-        "mstsc.exe"
-            | "msrdc.exe"
-            | "anydesk.exe"
-            | "teamviewer.exe"
-            | "teamviewer_desktop.exe"
-            | "screenconnect.clientservice.exe"
-            | "screenconnect.windowsclient.exe"
-            | "splashtop.exe"
-            | "strwinclt.exe"
-            | "rustdesk.exe"
-    ) {
-        PasteStrategy::RemoteSession
-    } else {
-        PasteStrategy::Standard
+    use crate::remote_clients::{classify_remote_process, RemoteClient};
+    match classify_remote_process(process_name) {
+        Some(RemoteClient::Ninja) => PasteStrategy::NinjaRemote,
+        Some(RemoteClient::Generic | RemoteClient::Rdp) => PasteStrategy::RemoteSession,
+        None => PasteStrategy::Standard,
     }
 }
 
@@ -477,6 +462,8 @@ pub fn restore_previous_foreground_window() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         paste_context, paste_settle_delay, paste_strategy_for_process, set_previous_target,
         should_auto_paste, should_auto_paste_with_mode, PasteStrategy,
@@ -512,6 +499,14 @@ mod tests {
             paste_settle_delay(PasteStrategy::NinjaRemote)
                 < paste_settle_delay(PasteStrategy::Standard)
         );
+    }
+
+    #[test]
+    fn mremoteng_paste_waits_for_remote_clipboard_synchronization() {
+        let strategy = paste_strategy_for_process("mRemoteNG.exe");
+        assert_eq!(strategy, PasteStrategy::RemoteSession);
+        assert_eq!(paste_settle_delay(strategy), Duration::from_millis(600));
+        assert!(should_auto_paste_with_mode(strategy, "copy_then_paste"));
     }
 
     #[test]

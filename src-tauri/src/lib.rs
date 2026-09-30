@@ -50,6 +50,7 @@ mod ocr_queue;
 mod paste_after_settle;
 pub mod paste_engine;
 mod path_grant;
+pub mod remote_clients;
 // SBS-219 budgets. Compiled for tests (which measure them) and for the
 // dev-harness binaries; a release build compiles neither arm.
 #[cfg(any(test, feature = "dev-harness"))]

@@ -31,8 +31,6 @@ use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::CloseHandle;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::MAX_PATH;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -45,9 +43,9 @@ use windows::Win32::Storage::FileSystem::{
 #[cfg(target_os = "windows")]
 use windows::Win32::System::DataExchange::GetClipboardOwner;
 #[cfg(target_os = "windows")]
-use windows::Win32::System::ProcessStatus::{GetModuleBaseNameW, GetModuleFileNameExW};
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
@@ -295,11 +293,106 @@ type SourceAppInfo = (
     bool,
 );
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceAppIdentity {
     process_id: u32,
     is_explicit_owner: bool,
 }
+
+/// Resolve executable ownership while capturing, before queued work can outlive
+/// its source process or the PID can be reused. Decorative metadata is loaded
+/// later from this path, without reopening the process.
+#[derive(Default)]
+struct CapturedSourceApp {
+    identity: Option<SourceAppIdentity>,
+    exe_name: Option<String>,
+    full_path: Option<String>,
+}
+
+impl CapturedSourceApp {
+    fn is_rdp_owner(&self) -> bool {
+        is_rdp_client_owner(self.exe_name.as_deref(), self.is_explicit_owner())
+    }
+
+    fn is_explicit_owner(&self) -> bool {
+        self.identity.is_some_and(|owner| owner.is_explicit_owner)
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct RdpPollingState {
+    owner: Option<SourceAppIdentity>,
+    timed_out_sequence: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+impl RdpPollingState {
+    fn observe(&mut self, notification: bool, sequence: u32, source: &CapturedSourceApp) {
+        if notification && self.timed_out_sequence != Some(sequence) {
+            self.timed_out_sequence = None;
+            self.owner = source.is_rdp_owner().then_some(source.identity).flatten();
+        } else if source.identity != self.owner {
+            self.owner = None;
+        }
+    }
+
+    fn record_attempt(&mut self, sequence: u32, attempt: CaptureAttempt) {
+        if matches!(
+            attempt,
+            CaptureAttempt::OwnerUnresponsive | CaptureAttempt::RetryBudgetExhausted
+        ) {
+            self.owner = None;
+            self.timed_out_sequence = Some(sequence);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum CaptureTrigger {
+    Notification,
+    RdpTextPoll(SourceAppIdentity),
+}
+
+#[cfg(target_os = "windows")]
+#[derive(PartialEq, Eq)]
+struct CaptureFingerprint {
+    sequence: u32,
+    owner: Option<SourceAppIdentity>,
+    hash: String,
+    sensitive: SensitiveMarkers,
+}
+
+#[cfg(target_os = "windows")]
+impl CaptureFingerprint {
+    fn metadata_matches(
+        &self,
+        observed_owner: Option<SourceAppIdentity>,
+        observed_sensitive: SensitiveMarkers,
+    ) -> bool {
+        self.owner == observed_owner && self.sensitive == observed_sensitive
+    }
+
+    fn should_queue_rdp_sample(
+        &self,
+        expected_owner: SourceAppIdentity,
+        observed_owner: Option<SourceAppIdentity>,
+        observed_sensitive: SensitiveMarkers,
+        last: Option<&Self>,
+    ) -> bool {
+        self.owner == Some(expected_owner)
+            && observed_owner == Some(expected_owner)
+            && self.metadata_matches(observed_owner, observed_sensitive)
+            && last != Some(self)
+    }
+}
+
+/// RDP's delayed text can change without a notification or sequence advance.
+/// Sample only after a new notification armed a known, actual RDP owner; never
+/// import a pre-existing clipboard at startup or repeatedly decode images.
+#[cfg(target_os = "windows")]
+const RDP_TEXT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 
 struct ClipboardImageRead {
     png_bytes: Vec<u8>,
@@ -328,7 +421,7 @@ enum CapturedContent {
 
 struct ClipboardSnapshot {
     sequence: u32,
-    source_app_identity: Option<SourceAppIdentity>,
+    source_app: Box<CapturedSourceApp>,
     content: CapturedContent,
     formats: Vec<CapturedFormat>,
     materialize_ms: u128,
@@ -416,13 +509,21 @@ fn captured_clip_hash(content: &CapturedContent, formats: &[CapturedFormat]) -> 
         CapturedContent::Text { content, .. } => ("text", content.as_slice()),
         CapturedContent::Image { png_bytes, .. } => ("image", png_bytes.as_slice()),
     };
-    calculate_hash(&build_clip_hash_material(
-        clip_type,
-        primary,
-        formats
-            .iter()
-            .map(|format| (format.name, format.content.as_slice())),
-    ))
+    // Stream the same identity as build_clip_hash_material without allocating
+    // and copying another combined text/HTML/RTF buffer for every RDP sample.
+    let mut hasher = Sha256::new();
+    hasher.update(clip_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(primary);
+    if clip_type != "image" {
+        for format in formats {
+            hasher.update([0]);
+            hasher.update(format.name.as_bytes());
+            hasher.update([0]);
+            hasher.update(&format.content);
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// SBS-1039: a flood-evicted snapshot never reaches
@@ -456,40 +557,90 @@ fn release_ignore_for_dropped_events(evicted: &[ClipboardListenerEvent]) {
 /// A remote-control viewer sets the first on *everything* it forwards, because
 /// it cannot know what the far-end application meant. Honoring that dropped
 /// every remote-session copy and left a hole in history that reads as lost
-/// data (SBS-781). The other two are set by the application that owns the
-/// secret and are forwarded unchanged, so they still describe the content when
-/// it arrives over RDP — KeePass through mstsc has to keep being honored
-/// (SBS-1000). Keeping them apart is what lets both be true.
+/// data (SBS-781). Windows RDP also adds `CanIncludeInClipboardHistory = 0`
+/// together with `CanUploadToCloudClipboard = 0` to ordinary redirected text.
+/// Those transport tags cannot identify an originating application's intent.
+/// `Clipboard Viewer Ignore` remains an explicit content exclusion, including
+/// when forwarded through RDP (SBS-1000).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SensitiveMarkers {
     /// `ExcludeClipboardContentFromMonitorProcessing`. A blanket tag: trusted
     /// from a local application, not from a viewer relaying someone else's
     /// clipboard.
     monitor_exclusion: bool,
-    /// `Clipboard Viewer Ignore`, or `CanIncludeInClipboardHistory` = 0. Set by
-    /// the application that owns the content, so it survives the trip.
+    /// `Clipboard Viewer Ignore`, an explicit content exclusion.
     content_owner: bool,
+    /// `CanIncludeInClipboardHistory` = 0. Also synthesized by Windows RDP.
+    history_exclusion: bool,
+    /// `CanUploadToCloudClipboard` = 0. The paired RDP transport marker.
+    cloud_exclusion: bool,
 }
 
 impl SensitiveMarkers {
     /// Any marker at all. Drives the marker Cubby re-applies when it rewrites
     /// the clipboard, which must not silently drop a tag that was there.
     fn any(self) -> bool {
-        self.monitor_exclusion || self.content_owner
+        self.monitor_exclusion
+            || self.content_owner
+            || self.history_exclusion
+            || self.cloud_exclusion
     }
 }
 
-/// Read the markers. Presence checks do not require opening the clipboard; the
-/// DWORD does, and is best-effort: present but unreadable does not skip.
+/// Presence is authoritative for monitor/viewer exclusions. DWORD values are
+/// read through the bounded OLE worker; an unreadable value is an error, never
+/// permission to retain or relay a potentially excluded copy.
 #[cfg(target_os = "windows")]
-fn clipboard_marked_sensitive() -> SensitiveMarkers {
-    SensitiveMarkers {
+fn clipboard_marked_sensitive() -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure> {
+    let mut markers = SensitiveMarkers {
         monitor_exclusion: clipboard_format_available(
             "ExcludeClipboardContentFromMonitorProcessing",
         ),
-        content_owner: clipboard_format_available("Clipboard Viewer Ignore")
-            || clipboard_history_opted_out(),
+        content_owner: clipboard_format_available("Clipboard Viewer Ignore"),
+        ..Default::default()
+    };
+    if !clipboard_format_available("CanIncludeInClipboardHistory")
+        && !clipboard_format_available("CanUploadToCloudClipboard")
+    {
+        return Ok(markers);
     }
+    crate::clipboard_reader::with_reader(move |reader| {
+        markers.history_exclusion =
+            clipboard_dword_opted_out(reader, "CanIncludeInClipboardHistory")?;
+        markers.cloud_exclusion = clipboard_dword_opted_out(reader, "CanUploadToCloudClipboard")?;
+        Ok::<_, String>(markers)
+    })?
+    .0
+    .map_err(crate::clipboard_reader::ReadFailure::Failed)
+}
+
+#[cfg(target_os = "windows")]
+fn capture_sensitive_markers(sequence: u32) -> Result<SensitiveMarkers, CaptureAttempt> {
+    retry_sensitive_markers(clipboard_marked_sensitive, std::thread::sleep).map_err(|error| match error {
+        crate::clipboard_reader::ReadFailure::Unresponsive => {
+            note_clipboard_event(sequence);
+            record_capture_error(format!("clipboard owner did not render privacy markers for sequence {sequence} within 30 s; that copy was not captured"));
+            CaptureAttempt::OwnerUnresponsive
+        }
+        crate::clipboard_reader::ReadFailure::Failed(_) =>
+            defer_or_exhaust_capture(sequence, "privacy markers were unreadable"),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn retry_sensitive_markers(
+    mut read: impl FnMut() -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure>,
+    mut pause: impl FnMut(Duration),
+) -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure> {
+    for attempt in 0..10 {
+        match read() {
+            Err(crate::clipboard_reader::ReadFailure::Failed(_)) if attempt + 1 < 10 => {
+                pause(clipboard_retry_delay(attempt))
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 #[cfg(target_os = "windows")]
@@ -505,31 +656,26 @@ fn clipboard_format_available(name: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn clipboard_history_opted_out() -> bool {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+fn clipboard_dword_opted_out(
+    reader: &crate::clipboard_reader::Reader,
+    name: &str,
+) -> Result<bool, String> {
+    let format = register_clipboard_format(name);
+    if format == 0 {
+        return Err("could not register clipboard privacy format".into());
+    }
+    if !crate::clipboard_reader::available(format) {
+        return Ok(false);
+    }
+    decode_privacy_dword(&reader.bytes(format)?)
+}
 
-    let utf16: Vec<u16> = "CanIncludeInClipboardHistory"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let format = unsafe { RegisterClipboardFormatW(PCWSTR(utf16.as_ptr())) };
-    if format == 0 || !clipboard_format_available("CanIncludeInClipboardHistory") {
-        return false;
-    }
-    // raw::get reads through GetClipboardData, which returns nothing unless
-    // this process holds the clipboard open. Without this the DWORD was never
-    // readable, so the marker silently never fired. The open is gated on the
-    // presence check above, so only apps that set the format pay for it.
-    let Ok(_clipboard) = clipboard_win::Clipboard::new_attempts(10) else {
-        log::debug!("CLIPBOARD: Could not open the clipboard to read CanIncludeInClipboardHistory");
-        return false;
-    };
-    let mut buffer = [0_u8; 4];
-    match clipboard_win::raw::get(format, &mut buffer) {
-        Ok(written) if written >= 4 => u32::from_le_bytes(buffer) == 0,
-        _ => false,
-    }
+#[cfg(target_os = "windows")]
+fn decode_privacy_dword(bytes: &[u8]) -> Result<bool, String> {
+    let value = bytes
+        .get(..4)
+        .ok_or("clipboard privacy DWORD was unreadable")?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()) == 0)
 }
 
 pub(crate) struct CapturedFormat {
@@ -609,6 +755,10 @@ enum CaptureAttempt {
     /// Supported content is present but every clipboard open lost the race.
     /// The sequence stays unhandled so the watchdog retries it.
     Deferred,
+    /// A delayed-render owner timed out. Do not sample it again until Windows
+    /// announces another copy, which may belong to a responsive owner.
+    OwnerUnresponsive,
+    RetryBudgetExhausted,
 }
 
 /// How many times one capture may restart after the clipboard sequence moves
@@ -784,12 +934,15 @@ fn deferral_decision(
 fn capture_clipboard_update(
     mut sequence: u32,
     event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    trigger: CaptureTrigger,
+    last_capture: &mut Option<CaptureFingerprint>,
 ) -> Result<CaptureAttempt, ()> {
     let read_sequence =
         || unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
 
     for bind_attempt in 0..MAX_SEQUENCE_BIND_ATTEMPTS {
-        match capture_one_bound_sequence(sequence, &read_sequence, event_tx) {
+        match capture_one_bound_sequence(sequence, &read_sequence, event_tx, trigger, last_capture)
+        {
             Ok(attempt) => return Ok(attempt),
             Err(BoundCaptureFailure::ConsumerGone) => return Err(()),
             Err(BoundCaptureFailure::Sequence(SequenceBindError::Changed { from, to })) => {
@@ -837,6 +990,8 @@ fn capture_one_bound_sequence(
     mut sequence: u32,
     read_sequence: &impl Fn() -> u32,
     event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    trigger: CaptureTrigger,
+    last_capture: &mut Option<CaptureFingerprint>,
 ) -> Result<CaptureAttempt, BoundCaptureFailure> {
     let started = Instant::now();
     let live = read_sequence();
@@ -848,8 +1003,21 @@ fn capture_one_bound_sequence(
     // Delayed rendering can enqueue more notifications while this thread is
     // materializing. A notification is not a new copy: do not reopen a sequence
     // whose snapshot was already queued. Never suppress unknown sequence zero.
-    if sequence != 0 && sequence == LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst) {
+    if matches!(trigger, CaptureTrigger::Notification)
+        && sequence != 0
+        && sequence == LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst)
+    {
         return Ok(CaptureAttempt::Handled);
+    }
+
+    if let CaptureTrigger::RdpTextPoll(owner) = trigger {
+        if get_clipboard_owner_identity() != Some(owner)
+            || !clipboard_has_unicode_text_format()
+            || clipboard_has_image_format()
+            || clipboard_has_file_payload_format()
+        {
+            return Ok(CaptureAttempt::Handled);
+        }
     }
 
     // Excel closes an empty clipboard before publishing its new formats. Do
@@ -873,7 +1041,12 @@ fn capture_one_bound_sequence(
     let has_file_payload = clipboard_has_file_payload_format();
     let has_image_payload = clipboard_has_image_format();
     let source_app_identity = get_clipboard_owner_identity();
-    let sensitive = clipboard_marked_sensitive();
+    let source_app = capture_source_app(source_app_identity);
+    let rdp_owner = source_app.is_rdp_owner();
+    let sensitive = match capture_sensitive_markers(sequence) {
+        Ok(markers) => markers,
+        Err(attempt) => return Ok(attempt),
+    };
     let after_metadata = read_sequence();
     if after_metadata != sequence {
         return Err(SequenceBindError::Changed {
@@ -904,7 +1077,7 @@ fn capture_one_bound_sequence(
         sequence,
         read_sequence,
         |attempt| {
-            let (outcome, after_reads) = materialize_clipboard_content_once(attempt);
+            let (outcome, after_reads) = materialize_clipboard_content_once(attempt, rdp_owner);
             let decided = match outcome {
                 MaterializeOnce::Captured(content, formats) => {
                     MaterializeAttempt::Captured(content, formats)
@@ -924,6 +1097,39 @@ fn capture_one_bound_sequence(
     )?;
 
     if let Some(MaterializeAttempt::Captured(content, formats)) = materialized {
+        let fingerprint = CaptureFingerprint {
+            sequence,
+            owner: source_app_identity,
+            hash: captured_clip_hash(&content, &formats),
+            sensitive,
+        };
+        // RDP can change data and privacy markers without advancing the
+        // sequence. Validate notifications too, not just later samples.
+        if rdp_owner {
+            let observed_sensitive = match capture_sensitive_markers(sequence) {
+                Ok(markers) => markers,
+                Err(attempt) => return Ok(attempt),
+            };
+            if !fingerprint.metadata_matches(get_clipboard_owner_identity(), observed_sensitive) {
+                return Ok(CaptureAttempt::Deferred);
+            }
+        }
+        // A sequence may represent many RDP copies. Count consecutive failed
+        // reads, not unrelated contention episodes across successful samples.
+        reset_capture_deferrals(&DEFERRED_SEQUENCE, &DEFERRED_ATTEMPTS, sequence);
+        if let CaptureTrigger::RdpTextPoll(owner) = trigger {
+            if !matches!(&content, CapturedContent::Text { .. })
+                || !rdp_owner
+                || !fingerprint.should_queue_rdp_sample(
+                    owner,
+                    source_app_identity,
+                    sensitive,
+                    last_capture.as_ref(),
+                )
+            {
+                return Ok(CaptureAttempt::Handled);
+            }
+        }
         // The guard proved every read came from `sequence`. Queue it even if a
         // newer copy has landed since; that copy is captured on its own.
         note_clipboard_event(sequence);
@@ -937,16 +1143,17 @@ fn capture_one_bound_sequence(
         );
         let snapshot = ClipboardSnapshot {
             sequence,
-            source_app_identity,
+            source_app: Box::new(source_app),
             content,
             formats,
             materialize_ms: started.elapsed().as_millis(),
             sensitive,
             ignore,
         };
-        return enqueue_listener_event(event_tx, ClipboardListenerEvent::Content(snapshot))
-            .map(|_| CaptureAttempt::Handled)
-            .map_err(|_| BoundCaptureFailure::ConsumerGone);
+        enqueue_listener_event(event_tx, ClipboardListenerEvent::Content(snapshot))
+            .map_err(|_| BoundCaptureFailure::ConsumerGone)?;
+        *last_capture = Some(fingerprint);
+        return Ok(CaptureAttempt::Handled);
     }
 
     persist_if_sequence_holds(sequence, read_sequence(), ())?;
@@ -958,7 +1165,7 @@ fn capture_one_bound_sequence(
         record_capture_error(format!(
             "clipboard owner did not render sequence {sequence} within 30 s; that copy was not captured"
         ));
-        return Ok(CaptureAttempt::Handled);
+        return Ok(CaptureAttempt::OwnerUnresponsive);
     }
 
     if matches!(materialized, Some(MaterializeAttempt::DeterminateMiss)) {
@@ -1006,34 +1213,10 @@ fn capture_one_bound_sequence(
 
     if clipboard_has_supported_format() {
         persist_if_sequence_holds(sequence, read_sequence(), ())?;
-        let (attempts, decision) = deferral_decision(
-            DEFERRED_SEQUENCE.load(Ordering::SeqCst),
-            DEFERRED_ATTEMPTS.load(Ordering::SeqCst),
+        return Ok(defer_or_exhaust_capture(
             sequence,
-            MAX_DEFERRALS_PER_SEQUENCE,
-        );
-        DEFERRED_SEQUENCE.store(sequence, Ordering::SeqCst);
-        DEFERRED_ATTEMPTS.store(attempts, Ordering::SeqCst);
-
-        if decision == CaptureAttempt::Deferred {
-            log::warn!(
-                "CLIPBOARD: Could not materialize sequence {} (clipboard contended); deferring for watchdog retry (attempt {} of {})",
-                sequence,
-                attempts,
-                MAX_DEFERRALS_PER_SEQUENCE
-            );
-            return Ok(CaptureAttempt::Deferred);
-        }
-
-        // The owner never released the clipboard. Mark the sequence handled so
-        // the watchdog stops restarting the listener over one lost copy, and
-        // record it: the contract is that a failed capture is visible in
-        // diagnostics rather than silently reported as a success.
-        note_clipboard_event(sequence);
-        record_capture_error(format!(
-            "clipboard sequence {sequence} stayed locked across {attempts} attempts; that copy was not captured"
+            "clipboard stayed contended",
         ));
-        return Ok(CaptureAttempt::Handled);
     }
 
     persist_if_sequence_holds(sequence, read_sequence(), ())?;
@@ -1045,6 +1228,31 @@ fn capture_one_bound_sequence(
         sequence
     );
     Ok(CaptureAttempt::Handled)
+}
+
+#[cfg(target_os = "windows")]
+fn reset_capture_deferrals(sequence: &AtomicU32, attempts: &AtomicU32, current: u32) {
+    sequence.store(current, Ordering::SeqCst);
+    attempts.store(0, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn defer_or_exhaust_capture(sequence: u32, reason: &str) -> CaptureAttempt {
+    let (attempts, decision) = deferral_decision(
+        DEFERRED_SEQUENCE.load(Ordering::SeqCst),
+        DEFERRED_ATTEMPTS.load(Ordering::SeqCst),
+        sequence,
+        MAX_DEFERRALS_PER_SEQUENCE,
+    );
+    DEFERRED_SEQUENCE.store(sequence, Ordering::SeqCst);
+    DEFERRED_ATTEMPTS.store(attempts, Ordering::SeqCst);
+    if decision == CaptureAttempt::Deferred {
+        log::warn!("CLIPBOARD: Sequence {sequence} deferred: {reason} (attempt {attempts} of {MAX_DEFERRALS_PER_SEQUENCE})");
+        return decision;
+    }
+    note_clipboard_event(sequence);
+    record_capture_error(format!("clipboard sequence {sequence}: {reason} across {attempts} attempts; that copy was not captured"));
+    CaptureAttempt::RetryBudgetExhausted
 }
 
 /// True when the clipboard advertises a format `materialize_clipboard_content_once`
@@ -1157,18 +1365,56 @@ fn clipboard_has_image_format() -> bool {
 fn run_listener_session(
     monitor: &mut Monitor,
     event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    last_capture: &mut Option<CaptureFingerprint>,
+    polling: &mut RdpPollingState,
 ) -> ListenerSessionExit {
     loop {
-        match monitor.recv() {
-            Ok(true) => {
-                let sequence =
-                    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
-                if capture_clipboard_update(sequence, event_tx).is_err() {
-                    return ListenerSessionExit::ConsumerGone;
-                }
+        // try_recv discards shutdown messages. Check this even after ownership
+        // changed back to a local application, before blocking in recv again.
+        if LISTENER_SHUTDOWN.lock().is_none() {
+            return ListenerSessionExit::RestartRequested;
+        }
+        let notification = if polling.owner.is_some() {
+            // try_recv ignores the monitor's shutdown message. The supervisor
+            // clears this slot before dropping its shutdown handle, so retain
+            // the watchdog's restart signal even while sampling RDP text.
+            match monitor.try_recv() {
+                Ok(received) => received,
+                Err(error) => return ListenerSessionExit::Failed(error.to_string()),
             }
-            Ok(false) => return ListenerSessionExit::RestartRequested,
-            Err(error) => return ListenerSessionExit::Failed(error.to_string()),
+        } else {
+            match monitor.recv() {
+                Ok(true) => true,
+                Ok(false) => return ListenerSessionExit::RestartRequested,
+                Err(error) => return ListenerSessionExit::Failed(error.to_string()),
+            }
+        };
+
+        let sequence =
+            unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        let owner = get_clipboard_owner_identity();
+        if notification {
+            polling.observe(true, sequence, &capture_source_app(owner));
+        } else if owner != polling.owner {
+            // A local application took ownership; return to event-driven reads.
+            polling.owner = None;
+        }
+
+        let trigger = if notification {
+            CaptureTrigger::Notification
+        } else if let Some(owner) = polling.owner {
+            CaptureTrigger::RdpTextPoll(owner)
+        } else {
+            continue;
+        };
+        match capture_clipboard_update(sequence, event_tx, trigger, last_capture) {
+            Err(()) => return ListenerSessionExit::ConsumerGone,
+            Ok(attempt) => {
+                polling.record_attempt(LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst), attempt)
+            }
+        }
+        if polling.owner.is_some() {
+            std::thread::sleep(RDP_TEXT_POLL_INTERVAL);
         }
     }
 }
@@ -1259,6 +1505,10 @@ fn run_native_listener(event_tx: snapshot_channel::Sender<ClipboardListenerEvent
 
     let mut backoff = INITIAL_LISTENER_BACKOFF;
     let mut first_session = true;
+    let mut last_capture = None;
+    // A monitor restart replaces the message window, not the last observed
+    // clipboard owner. Preserve sampling and timeout disarm across sessions.
+    let mut polling = RdpPollingState::default();
     loop {
         set_capture_state(CAPTURE_STATE_RESTARTING);
 
@@ -1292,16 +1542,31 @@ fn run_native_listener(event_tx: snapshot_channel::Sender<ClipboardListenerEvent
                 "CLIPBOARD: Catching up on clipboard sequence {} missed during listener restart",
                 current_sequence
             );
-            if capture_clipboard_update(current_sequence, &event_tx).is_err() {
-                record_capture_error("snapshot consumer stopped; capture supervisor exiting");
-                set_capture_state(CAPTURE_STATE_STOPPED);
-                return;
+            polling.observe(
+                true,
+                current_sequence,
+                &capture_source_app(get_clipboard_owner_identity()),
+            );
+            match capture_clipboard_update(
+                current_sequence,
+                &event_tx,
+                CaptureTrigger::Notification,
+                &mut last_capture,
+            ) {
+                Ok(attempt) => {
+                    polling.record_attempt(LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst), attempt)
+                }
+                Err(()) => {
+                    record_capture_error("snapshot consumer stopped; capture supervisor exiting");
+                    set_capture_state(CAPTURE_STATE_STOPPED);
+                    return;
+                }
             }
         }
         set_capture_state(CAPTURE_STATE_LISTENING);
         log::info!("CLIPBOARD: Native WM_CLIPBOARDUPDATE listener started");
 
-        let exit = run_listener_session(&mut monitor, &event_tx);
+        let exit = run_listener_session(&mut monitor, &event_tx, &mut last_capture, &mut polling);
         *LISTENER_SHUTDOWN.lock() = None;
         drop(monitor);
 
@@ -1345,7 +1610,10 @@ fn run_native_listener(_event_tx: snapshot_channel::Sender<ClipboardListenerEven
 /// Also returns the clipboard sequence seen right after the last read (see
 /// [`materialize_with_sequence_guard`]).
 #[cfg(target_os = "windows")]
-fn materialize_clipboard_content_once(attempt: u32) -> (MaterializeOnce, u32) {
+fn materialize_clipboard_content_once(
+    attempt: u32,
+    coherent_rdp_text: bool,
+) -> (MaterializeOnce, u32) {
     let sequence = || unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
     // A sequence may become empty while we are binding metadata. The outer
     // sequence guard will rebind it; never open an empty publication in here.
@@ -1353,7 +1621,7 @@ fn materialize_clipboard_content_once(attempt: u32) -> (MaterializeOnce, u32) {
         return (MaterializeOnce::DeterminateMiss, sequence());
     }
     match crate::clipboard_reader::with_reader(move |reader| {
-        materialize_from_reader(reader, attempt)
+        materialize_from_reader(reader, attempt, coherent_rdp_text)
     }) {
         Ok(read) => read,
         Err(crate::clipboard_reader::ReadFailure::Unresponsive) => {
@@ -1370,6 +1638,7 @@ fn materialize_clipboard_content_once(attempt: u32) -> (MaterializeOnce, u32) {
 fn materialize_from_reader(
     reader: &crate::clipboard_reader::Reader,
     attempt: u32,
+    coherent_rdp_text: bool,
 ) -> MaterializeOnce {
     let last_attempt = attempt + 1 == 10;
     if clipboard_has_image_format() && clipboard_has_file_payload_format() {
@@ -1379,15 +1648,24 @@ fn materialize_from_reader(
         };
     }
 
-    let text = reader.text().ok();
-    let html = reader
-        .bytes(register_clipboard_format("HTML Format"))
-        .ok()
-        .and_then(|bytes| crate::cf_html::html_document_from_cf_html(&bytes));
-    let rtf = reader
-        .bytes(register_clipboard_format("Rich Text Format"))
-        .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let Some((text, html, rtf)) = read_text_formats(
+        || reader.text().ok(),
+        || {
+            reader
+                .bytes(register_clipboard_format("HTML Format"))
+                .ok()
+                .and_then(|bytes| crate::cf_html::html_document_from_cf_html(&bytes))
+        },
+        || {
+            reader
+                .bytes(register_clipboard_format("Rich Text Format"))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        },
+        coherent_rdp_text,
+    ) else {
+        return MaterializeOnce::Transient;
+    };
     let text_read = observed_payload(&text, clipboard_has_unicode_text_format());
     let html_read = observed_payload(&html, clipboard_has_html_format());
     let rtf_read = observed_payload(&rtf, clipboard_has_rtf_format());
@@ -1422,6 +1700,25 @@ fn materialize_from_reader(
         crate::clipboard_miss::CaptureDecision::DeterminateMiss => MaterializeOnce::DeterminateMiss,
         crate::clipboard_miss::CaptureDecision::Transient => MaterializeOnce::Transient,
     }
+}
+
+/// RDP's data object can render a newer payload under the same clipboard
+/// sequence. Surround auxiliary format reads with a second Unicode read so a
+/// username preview cannot be paired with a subsequent password's RTF.
+#[cfg(target_os = "windows")]
+fn read_text_formats(
+    mut read_text: impl FnMut() -> Option<String>,
+    read_html: impl FnOnce() -> Option<String>,
+    read_rtf: impl FnOnce() -> Option<String>,
+    coherent_rdp_text: bool,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let text = read_text();
+    let html = read_html();
+    let rtf = read_rtf();
+    if coherent_rdp_text && read_text() != text {
+        return None;
+    }
+    Some((text, html, rtf))
 }
 
 /// All payload bytes are detached from the OLE medium before image parsing or
@@ -1894,10 +2191,7 @@ fn write_image_clipboard_formats(prepared: &PreparedImageFormats<'_>) -> Result<
 /// writes whatever it received from the far end, so the metadata on that write
 /// describes the *viewer's* policy, not what the originating application meant.
 fn is_remote_client_process(exe_name: Option<&str>) -> bool {
-    exe_name.is_some_and(|exe| {
-        crate::paste_engine::paste_strategy_for_process(exe)
-            != crate::paste_engine::PasteStrategy::Standard
-    })
+    exe_name.is_some_and(|exe| crate::remote_clients::classify_remote_process(exe).is_some())
 }
 
 /// True when a remote client is the *attributed owner* of this clipboard write.
@@ -1910,6 +2204,14 @@ fn is_remote_client_process(exe_name: Option<&str>) -> bool {
 /// the way into history. An unattributed write is never treated as remote.
 fn is_remote_client_owner(exe_name: Option<&str>, is_explicit_owner: bool) -> bool {
     is_explicit_owner && is_remote_client_process(exe_name)
+}
+
+fn is_rdp_client_owner(exe_name: Option<&str>, is_explicit_owner: bool) -> bool {
+    is_explicit_owner
+        && exe_name.is_some_and(|exe| {
+            crate::remote_clients::classify_remote_process(exe)
+                == Some(crate::remote_clients::RemoteClient::Rdp)
+        })
 }
 
 /// Relay only captures owned by a remote-control viewer.
@@ -1930,18 +2232,22 @@ fn should_relay_capture(relay_enabled: bool, remote_client: bool, app_ignored: b
 
 /// Whether a sensitive-tagged capture should be dropped instead of stored.
 ///
-/// An owner-set marker describes the content, so it is honored wherever the
-/// content came from: KeePass forwarded through a remote viewer must not be
-/// stored when Settings says it will not be (SBS-1000). A viewer's blanket
-/// monitor-exclusion tag describes the viewer, not the content, so it is
-/// honored from a local application and ignored from a recognized remote
-/// client — otherwise every remote-session copy disappears (SBS-781).
+/// Explicit exclusions still apply to local apps and forwarded KeePass copies.
+/// The paired Windows history/cloud DWORDs are a blanket transport policy when
+/// the actual owner is a recognized RDP client. RDP supplies the same pair for
+/// untagged text, so it cannot establish a remote source's privacy intent.
+/// Neither exception applies to foreground-only attribution.
 fn should_skip_sensitive_capture(
     skip_sensitive: bool,
     markers: SensitiveMarkers,
     remote_client: bool,
+    rdp_client: bool,
 ) -> bool {
-    skip_sensitive && (markers.content_owner || (markers.monitor_exclusion && !remote_client))
+    let rdp_transport = remote_client && rdp_client && markers.cloud_exclusion;
+    skip_sensitive
+        && (markers.content_owner
+            || (markers.history_exclusion && !rdp_transport)
+            || (markers.monitor_exclusion && !remote_client))
 }
 
 /// Outcome of the skip-likely-secrets capture gate.
@@ -2243,7 +2549,7 @@ async fn process_clipboard_snapshot(
     let markers = snapshot.sensitive;
     let queued_ignore = snapshot.ignore;
     let clip_hash = captured_clip_hash(&snapshot.content, &snapshot.formats);
-    let source_app_info = resolve_source_app_info(snapshot.source_app_identity);
+    let source_app_info = resolve_captured_source_app_info(*snapshot.source_app);
     let captured_formats = snapshot.formats;
     let (clip_type, mut clip_content, clip_preview, _primary_hash, full_image_content, metadata) =
         match snapshot.content {
@@ -2363,6 +2669,7 @@ async fn process_clipboard_snapshot(
     };
 
     let remote_client = is_remote_client_owner(exe_name.as_deref(), is_explicit_owner);
+    let rdp_client = is_rdp_client_owner(exe_name.as_deref(), is_explicit_owner);
 
     // Resolved before the relay because an ignored application is excluded from
     // transport too, not just from history.
@@ -2388,8 +2695,16 @@ async fn process_clipboard_snapshot(
     // emptied the clipboard and republished text/html/rtf only, which stripped
     // do-not-retain markers and Office private formats (SBS-1001). Content the
     // owning application tagged is never rewritten.
-    if should_skip_sensitive_capture(settings.skip_sensitive, markers, remote_client) {
-        log::info!("CLIPBOARD: Skipping content the source app marked as sensitive");
+    if should_skip_sensitive_capture(settings.skip_sensitive, markers, remote_client, rdp_client) {
+        log::info!(
+            "CLIPBOARD: Skipping sensitive content (viewer_ignore={}, history_exclusion={}, cloud_exclusion={}, monitor_exclusion={}, remote_owner={}, rdp_owner={})",
+            markers.content_owner,
+            markers.history_exclusion,
+            markers.cloud_exclusion,
+            markers.monitor_exclusion,
+            remote_client,
+            rdp_client
+        );
         discard_clear_target();
         return;
     }
@@ -2424,13 +2739,14 @@ async fn process_clipboard_snapshot(
     // `false` for app_ignored: the ignored-application return above already
     // ran, so nothing ignored reaches here.
     //
-    // An owner-marked copy is never republished — the rewrite carries only
-    // text/html/rtf plus the monitor-exclusion tag, so relaying KeePass would
-    // strip the very marker that protects it (SBS-1001). A viewer's blanket
-    // tag is re-applied on the way out, which is what keeps remote-session
-    // copies flowing (SBS-781).
+    // Never rewrite history/cloud opt-outs, including the RDP transport pair.
+    // Capturing for Cubby's local history does not grant permission to remove
+    // Windows' history/cloud policy. Explicit content exclusions likewise stay
+    // untouched (SBS-1001). The viewer's monitor-only tag can be re-applied.
     if should_relay_capture(settings.remote_clipboard_relay, remote_client, false)
         && !markers.content_owner
+        && !markers.history_exclusion
+        && !markers.cloud_exclusion
     {
         relay_remote_capture(
             clip_type,
@@ -3326,19 +3642,29 @@ fn get_clipboard_owner_identity() -> Option<SourceAppIdentity> {
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_source_app_info(identity: Option<SourceAppIdentity>) -> SourceAppInfo {
+fn capture_source_app(identity: Option<SourceAppIdentity>) -> CapturedSourceApp {
+    use windows::core::PWSTR;
+
     unsafe {
         let Some(identity) = identity else {
-            return (None, None, None, None, false);
+            return CapturedSourceApp::default();
         };
 
+        // Reading an executable path does not require access to its memory.
+        // The stronger rights can fail for elevated owners, hiding their remote
+        // classification and incorrectly turning their captures into ghosts.
         let process_handle = match OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            PROCESS_QUERY_LIMITED_INFORMATION,
             false,
             identity.process_id,
         ) {
             Ok(h) => h,
-            Err(_) => return (None, None, None, None, false),
+            Err(_) => {
+                return CapturedSourceApp {
+                    identity: Some(identity),
+                    ..Default::default()
+                }
+            }
         };
         // OpenProcess returns a kernel handle. Every other capture path
         // (paste target, Win+V helper) CloseHandle's it; this one did not, so
@@ -3353,62 +3679,62 @@ fn resolve_source_app_info(identity: Option<SourceAppIdentity>) -> SourceAppInfo
         }
         let _process_guard = ProcessHandleGuard(process_handle);
 
-        let mut name_buffer = [0u16; MAX_PATH as usize];
-        let name_size = GetModuleBaseNameW(process_handle, None, &mut name_buffer);
-        let exe_name = if name_size > 0 {
-            String::from_utf16_lossy(&name_buffer[..name_size as usize])
-        } else {
-            String::new()
-        };
-
-        let mut path_buffer = [0u16; MAX_PATH as usize];
-        let path_size = GetModuleFileNameExW(Some(process_handle), None, &mut path_buffer);
-        let (app_name, app_icon, full_path) = if path_size > 0 {
-            let full_path_str = String::from_utf16_lossy(&path_buffer[..path_size as usize]);
-
-            let desc = get_app_description(&full_path_str);
-            let final_name = if let Some(d) = desc {
-                Some(d)
-            } else {
-                if !exe_name.is_empty() {
-                    Some(exe_name.clone())
-                } else {
-                    None
-                }
-            };
-
-            let icon = extract_icon(&full_path_str);
-            (final_name, icon, Some(full_path_str))
-        } else {
-            (
-                if !exe_name.is_empty() {
-                    Some(exe_name.clone())
-                } else {
-                    None
-                },
-                None,
-                None,
-            )
-        };
-
-        let exe_val = if !exe_name.is_empty() {
-            Some(exe_name)
-        } else {
-            None
-        };
-        (
-            app_name,
-            app_icon,
-            exe_val,
-            full_path,
-            identity.is_explicit_owner,
+        let mut path_buffer = vec![0u16; 32768];
+        let mut path_size = path_buffer.len() as u32;
+        if QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(path_buffer.as_mut_ptr()),
+            &mut path_size,
         )
+        .is_err()
+        {
+            // A failed metadata lookup does not undo GetClipboardOwner's
+            // explicit ownership. Privacy still has no remote bypass without
+            // a recognized executable; ordinary copies can still be stored.
+            return CapturedSourceApp {
+                identity: Some(identity),
+                ..Default::default()
+            };
+        }
+        let full_path = String::from_utf16_lossy(&path_buffer[..path_size as usize]);
+        let exe_name = std::path::Path::new(&full_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        CapturedSourceApp {
+            identity: Some(identity),
+            exe_name,
+            full_path: Some(full_path),
+        }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn resolve_source_app_info(_identity: Option<SourceAppIdentity>) -> SourceAppInfo {
-    (None, None, None, None, false)
+fn capture_source_app(identity: Option<SourceAppIdentity>) -> CapturedSourceApp {
+    CapturedSourceApp {
+        identity,
+        ..Default::default()
+    }
+}
+
+fn resolve_captured_source_app_info(source: CapturedSourceApp) -> SourceAppInfo {
+    let explicit = source.is_explicit_owner();
+    #[cfg(target_os = "windows")]
+    let (name, icon) = source
+        .full_path
+        .as_deref()
+        .map_or((None, None), |path| unsafe {
+            (get_app_description(path), extract_icon(path))
+        });
+    #[cfg(not(target_os = "windows"))]
+    let (name, icon) = (None, None);
+    (
+        name.or_else(|| source.exe_name.clone()),
+        icon,
+        source.exe_name,
+        source.full_path,
+        explicit,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -3651,6 +3977,336 @@ pub use capture_probe::run_capture_probe;
 mod tests {
     #[cfg(target_os = "windows")]
     #[test]
+    fn successful_same_sequence_samples_reset_separate_contention_episodes() {
+        use super::{
+            deferral_decision, reset_capture_deferrals, CaptureAttempt, MAX_DEFERRALS_PER_SEQUENCE,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let sequence = AtomicU32::new(7);
+        let attempts = AtomicU32::new(0);
+        for _ in 0..100 {
+            let (count, decision) = deferral_decision(
+                sequence.load(Ordering::SeqCst),
+                attempts.load(Ordering::SeqCst),
+                7,
+                MAX_DEFERRALS_PER_SEQUENCE,
+            );
+            attempts.store(count, Ordering::SeqCst);
+            assert_eq!(decision, CaptureAttempt::Deferred);
+            // Both a changed coherent sample and an unchanged deduplicated
+            // sample must reset the retry budget before the next failure.
+            reset_capture_deferrals(&sequence, &attempts, 7);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn temporary_privacy_read_contention_recovers_without_exhausting_rdp_sampling() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let observed = super::retry_sensitive_markers(
+            || {
+                if elapsed.get() < Duration::from_millis(200) {
+                    Err(crate::clipboard_reader::ReadFailure::Failed(
+                        "transient contention".into(),
+                    ))
+                } else {
+                    Ok(super::SensitiveMarkers {
+                        history_exclusion: true,
+                        cloud_exclusion: true,
+                        ..Default::default()
+                    })
+                }
+            },
+            |delay| elapsed.set(elapsed.get() + delay),
+        )
+        .unwrap_or_else(|_| panic!("transient privacy reads should recover"));
+        assert!(observed.history_exclusion && observed.cloud_exclusion);
+        assert!(elapsed.get() >= Duration::from_millis(200));
+        let mut attempts = 0;
+        let hung = super::retry_sensitive_markers(
+            || {
+                attempts += 1;
+                Err(crate::clipboard_reader::ReadFailure::Unresponsive)
+            },
+            |_| panic!("a hung owner must not be retried"),
+        );
+        assert!(matches!(
+            hung,
+            Err(crate::clipboard_reader::ReadFailure::Unresponsive)
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unreadable_privacy_dwords_are_errors_rather_than_permission_to_retain_or_relay() {
+        for bytes in [vec![], vec![0], vec![0, 0, 0]] {
+            assert!(super::decode_privacy_dword(&bytes).is_err());
+        }
+        assert!(super::decode_privacy_dword(&[0, 0, 0, 0]).unwrap());
+        assert!(!super::decode_privacy_dword(&[1, 0, 0, 0]).unwrap());
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_restart_preserves_sampling_and_does_not_rearm_an_exhausted_owner() {
+        use super::{CaptureAttempt, CapturedSourceApp, RdpPollingState, SourceAppIdentity};
+        let source = CapturedSourceApp {
+            identity: Some(SourceAppIdentity {
+                process_id: 42,
+                is_explicit_owner: true,
+            }),
+            exe_name: Some("mRemoteNG.exe".into()),
+            full_path: None,
+        };
+        let mut polling = RdpPollingState::default();
+        // First startup must not import the current clipboard.
+        polling.observe(false, 7, &source);
+        assert!(polling.owner.is_none());
+        polling.observe(true, 7, &source);
+        // The supervisor passes this same state to a recreated monitor, even
+        // when its catch-up sees no new sequence and no notification.
+        polling.observe(false, 7, &source);
+        assert_eq!(polling.owner, source.identity);
+        for failed in [
+            CaptureAttempt::OwnerUnresponsive,
+            CaptureAttempt::RetryBudgetExhausted,
+        ] {
+            polling.record_attempt(7, failed);
+            for _ in 0..100 {
+                polling.observe(true, 7, &source);
+                assert!(polling.owner.is_none());
+            }
+            polling.observe(true, 8, &source);
+            assert_eq!(polling.owner, source.identity);
+            // Put the next iteration back on sequence 7.
+            polling.observe(true, 7, &source);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_rich_reads_reject_a_newer_password_under_the_username_sequence() {
+        use std::cell::Cell;
+        let changed = Cell::new(false);
+        let mixed = super::read_text_formats(
+            || {
+                Some(
+                    if changed.get() {
+                        "password"
+                    } else {
+                        "username"
+                    }
+                    .into(),
+                )
+            },
+            || None,
+            || {
+                changed.set(true);
+                Some("{\\rtf1 password}".into())
+            },
+            true,
+        );
+        assert!(
+            mixed.is_none(),
+            "mixed preview and normal-paste formats must never be queued"
+        );
+        let coherent = super::read_text_formats(
+            || Some("password".into()),
+            || None,
+            || Some("{\\rtf1 password}".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(coherent.0.as_deref(), Some("password"));
+        assert_eq!(coherent.2.as_deref(), Some("{\\rtf1 password}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn queued_source_identity_survives_the_source_process_exiting() {
+        use super::{capture_source_app, resolve_captured_source_app_info, SourceAppIdentity};
+        use std::os::windows::process::CommandExt;
+        let mut process = std::process::Command::new("cmd.exe")
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let source = capture_source_app(Some(SourceAppIdentity {
+            process_id: process.id(),
+            is_explicit_owner: true,
+        }));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let (_, _, exe, path, explicit) = resolve_captured_source_app_info(source);
+        assert_eq!(exe.as_deref(), Some("cmd.exe"));
+        assert!(path.is_some());
+        assert!(explicit);
+        let dead_rdp = super::CapturedSourceApp {
+            identity: Some(SourceAppIdentity {
+                process_id: process.id(),
+                is_explicit_owner: true,
+            }),
+            exe_name: Some("mRemoteNG.exe".into()),
+            full_path: Some("C:\\RdpQA\\mRemoteNG.exe".into()),
+        };
+        let (_, _, exe, path, explicit) = resolve_captured_source_app_info(dead_rdp);
+        assert_eq!(path.as_deref(), Some("C:\\RdpQA\\mRemoteNG.exe"));
+        assert!(!super::should_skip_sensitive_capture(
+            true,
+            super::SensitiveMarkers {
+                history_exclusion: true,
+                cloud_exclusion: true,
+                ..Default::default()
+            },
+            super::is_remote_client_owner(exe.as_deref(), explicit),
+            super::is_rdp_client_owner(exe.as_deref(), explicit),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_shutdown_consumed_by_nonblocking_monitor_still_restarts_before_a_blocking_read() {
+        use super::{run_listener_session, snapshot_channel, ListenerSessionExit};
+        let (ready, abort) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut monitor = clipboard_win::Monitor::new().expect("create test monitor");
+            // Simulate leaving RDP sampling after try_recv discarded shutdown.
+            drop(monitor.shutdown_channel());
+            while monitor.try_recv().expect("drain clipboard messages") {}
+            ready.send(monitor.shutdown_channel()).unwrap();
+            let (events, _receiver) = snapshot_channel::channel();
+            let exit = run_listener_session(
+                &mut monitor,
+                &events,
+                &mut None,
+                &mut super::RdpPollingState::default(),
+            );
+            let _ = done.send(exit);
+        });
+        let abort = abort
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor ready");
+        let exit = result.recv_timeout(Duration::from_secs(5));
+        // Also unblock the old implementation on a regression, so failure does
+        // not leave a thread waiting forever or require weakening the check.
+        drop(abort);
+        worker.join().expect("monitor thread exited");
+        assert!(matches!(exit, Ok(ListenerSessionExit::RestartRequested)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_samples_retain_changed_text_even_when_sequence_and_owner_never_advance() {
+        use super::{CaptureFingerprint, SensitiveMarkers, SourceAppIdentity};
+        let owner = SourceAppIdentity {
+            process_id: 42,
+            is_explicit_owner: true,
+        };
+        let sensitive = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..Default::default()
+        };
+        let mut last = None;
+        for index in 1..=100 {
+            let sample = CaptureFingerprint {
+                sequence: 7,
+                owner: Some(owner),
+                hash: format!("text-{index}"),
+                sensitive,
+            };
+            assert!(sample.should_queue_rdp_sample(owner, Some(owner), sensitive, last.as_ref()));
+            last = Some(sample);
+            assert!(!last.as_ref().unwrap().should_queue_rdp_sample(
+                owner,
+                Some(owner),
+                sensitive,
+                last.as_ref()
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_samples_recheck_privacy_and_ownership_without_deduplicating_a_new_exclusion() {
+        use super::{CaptureFingerprint, SensitiveMarkers, SourceAppIdentity};
+        let owner = SourceAppIdentity {
+            process_id: 42,
+            is_explicit_owner: true,
+        };
+        let previous = CaptureFingerprint {
+            sequence: 7,
+            owner: Some(owner),
+            hash: "same text".into(),
+            sensitive: SensitiveMarkers::default(),
+        };
+        let private = CaptureFingerprint {
+            sequence: previous.sequence,
+            owner: previous.owner,
+            hash: previous.hash.clone(),
+            sensitive: SensitiveMarkers {
+                content_owner: true,
+                ..Default::default()
+            },
+        };
+        assert!(private.should_queue_rdp_sample(
+            owner,
+            Some(owner),
+            private.sensitive,
+            Some(&previous)
+        ));
+        assert!(!private.should_queue_rdp_sample(
+            owner,
+            Some(owner),
+            previous.sensitive,
+            Some(&previous)
+        ));
+        let local_owner = SourceAppIdentity {
+            process_id: 43,
+            is_explicit_owner: true,
+        };
+        assert!(!private.should_queue_rdp_sample(
+            owner,
+            Some(local_owner),
+            private.sensitive,
+            None
+        ));
+        assert!(!private.should_queue_rdp_sample(owner, None, private.sensitive, None));
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn packed_v5_with_mask_colored_pixels_and_allocation_padding_is_not_shifted() {
+        let mut dib = vec![0u8; 124];
+        for (offset, value) in [
+            (0, 124u32),
+            (4, 2),
+            (8, (-2i32) as u32),
+            (16, 3),
+            (20, 16),
+            (40, 0x00ff0000),
+            (44, 0x0000ff00),
+            (48, 0x000000ff),
+            (56, 0x73524742),
+        ] {
+            dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        dib[12] = 1;
+        dib[14] = 32;
+        dib.extend_from_slice(&[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        dib.extend_from_slice(&[0; 12]);
+        let image = super::decode_clipboard_dib(dib).unwrap();
+        assert_eq!(
+            image.to_rgba8().as_raw(),
+            &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn packed_v4_and_v5_bitfields_keep_exact_pixels_and_alpha() {
         for size in [108_u32, 124] {
             let mut dib = vec![0_u8; size as usize];
@@ -3708,7 +4364,7 @@ mod tests {
     ) -> ClipboardSnapshot {
         ClipboardSnapshot {
             sequence,
-            source_app_identity: None,
+            source_app: Box::default(),
             content: CapturedContent::Text {
                 content: text.to_vec(),
                 preview: String::from_utf8_lossy(text).into_owned(),
@@ -3735,7 +4391,7 @@ mod tests {
     fn snapshot_payload_bytes_count_png_html_and_rtf() {
         let event = ClipboardListenerEvent::Content(ClipboardSnapshot {
             sequence: 1,
-            source_app_identity: None,
+            source_app: Box::default(),
             content: CapturedContent::Image {
                 png_bytes: vec![0; 1000],
                 width: 2,
@@ -3781,7 +4437,7 @@ mod tests {
         let content = |sequence: u32, bytes: usize| {
             ClipboardListenerEvent::Content(ClipboardSnapshot {
                 sequence,
-                source_app_identity: None,
+                source_app: Box::default(),
                 content: CapturedContent::Text {
                     content: vec![b'x'; bytes],
                     preview: String::new(),
@@ -3857,6 +4513,32 @@ mod tests {
             captured_clip_hash(&image, &formats),
             calculate_hash(&build_clip_hash_material("image", &png, std::iter::empty()))
         );
+        let unicode = "Unicode résumé 🔑\n".repeat(50_000).into_bytes();
+        let large = CapturedContent::Text {
+            content: unicode.clone(),
+            preview: "Unicode".into(),
+            hash: "unused".into(),
+        };
+        let rich = [
+            CapturedFormat {
+                name: "html",
+                content: b"<b>Unicode</b>".repeat(50_000),
+            },
+            CapturedFormat {
+                name: "rtf",
+                content: b"{\\rtf1 Unicode}".repeat(50_000),
+            },
+        ];
+        for formats in [&rich[..], &rich[..0]] {
+            assert_eq!(
+                captured_clip_hash(&large, formats),
+                calculate_hash(&build_clip_hash_material(
+                    "text",
+                    &unicode,
+                    formats.iter().map(|f| (f.name, f.content.as_slice()))
+                ))
+            );
+        }
     }
 
     /// A kept image still stores a real generated thumbnail (SBS-1077).
@@ -4367,7 +5049,8 @@ mod tests {
         assert!(should_skip_sensitive_capture(
             true,
             MONITOR_EXCLUSION,
-            is_remote_client_owner(Some("ncplayer.exe"), false)
+            is_remote_client_owner(Some("ncplayer.exe"), false),
+            false
         ));
     }
 
@@ -4375,11 +5058,15 @@ mod tests {
     const MONITOR_EXCLUSION: SensitiveMarkers = SensitiveMarkers {
         monitor_exclusion: true,
         content_owner: false,
+        history_exclusion: false,
+        cloud_exclusion: false,
     };
     /// What KeePass and friends set about content they own.
     const OWNER_MARKED: SensitiveMarkers = SensitiveMarkers {
         monitor_exclusion: false,
         content_owner: true,
+        history_exclusion: false,
+        cloud_exclusion: false,
     };
 
     #[cfg(target_os = "windows")]
@@ -4400,8 +5087,153 @@ mod tests {
         assert!(!should_skip_sensitive_capture(
             true,
             MONITOR_EXCLUSION,
-            true
+            true,
+            false
         ));
+    }
+
+    #[test]
+    fn mremoteng_history_and_relay_keep_the_existing_privacy_boundaries() {
+        for name in ["mRemoteNG.exe", "mremoteng.exe", "MREMOTENG.EXE"] {
+            let remote = is_remote_client_owner(Some(name), true);
+            assert!(remote);
+            assert!(!should_skip_sensitive_capture(
+                true,
+                MONITOR_EXCLUSION,
+                remote,
+                false
+            ));
+            assert!(should_skip_sensitive_capture(
+                true,
+                OWNER_MARKED,
+                remote,
+                false
+            ));
+            assert!(should_skip_sensitive_capture(
+                true,
+                SensitiveMarkers {
+                    monitor_exclusion: true,
+                    content_owner: true,
+                    ..SensitiveMarkers::default()
+                },
+                remote,
+                false
+            ));
+            assert!(should_relay_capture(true, remote, false));
+            assert!(!should_relay_capture(false, remote, false));
+            assert!(!should_relay_capture(true, remote, true));
+
+            // A foreground mRemoteNG window is never evidence that an
+            // unattributed local password copy came from the remote session.
+            let foreground_only = is_remote_client_owner(Some(name), false);
+            assert!(!foreground_only);
+            assert!(should_skip_sensitive_capture(
+                true,
+                MONITOR_EXCLUSION,
+                foreground_only,
+                false
+            ));
+            assert!(!should_relay_capture(true, foreground_only, false));
+        }
+    }
+
+    #[test]
+    fn ordinary_rdp_copies_with_paired_history_and_cloud_opt_outs_are_retained() {
+        // Observed on an actual mRemoteNG RDP connection: neither DWORD was
+        // present at the source, but the client supplied both as zero.
+        let transport = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..SensitiveMarkers::default()
+        };
+        for name in ["mRemoteNG.exe", "MSTSC.EXE", "msrdc.exe"] {
+            for explicit in [true, false] {
+                let remote = is_remote_client_owner(Some(name), explicit);
+                let rdp = super::is_rdp_client_owner(Some(name), explicit);
+                assert_eq!(
+                    should_skip_sensitive_capture(true, transport, remote, rdp),
+                    !explicit,
+                    "{name}, explicit={explicit}"
+                );
+                assert!(should_skip_sensitive_capture(
+                    true,
+                    SensitiveMarkers {
+                        content_owner: true,
+                        ..transport
+                    },
+                    remote,
+                    rdp
+                ));
+                // An isolated history denial is not the observed RDP pair.
+                assert!(should_skip_sensitive_capture(
+                    true,
+                    SensitiveMarkers {
+                        cloud_exclusion: false,
+                        ..transport
+                    },
+                    remote,
+                    rdp
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn paired_history_and_cloud_opt_outs_are_still_honored_outside_rdp() {
+        let markers = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..SensitiveMarkers::default()
+        };
+        for name in [
+            "notepad.exe",
+            "1Password.exe",
+            "ncplayer.exe",
+            "anydesk.exe",
+        ] {
+            assert!(should_skip_sensitive_capture(
+                true,
+                markers,
+                is_remote_client_owner(Some(name), true),
+                super::is_rdp_client_owner(Some(name), true)
+            ));
+        }
+        assert!(!should_skip_sensitive_capture(false, markers, false, false));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source_attribution_reads_executable_with_limited_process_rights() {
+        let expected = std::env::current_exe().unwrap();
+        let identity = super::SourceAppIdentity {
+            process_id: unsafe { windows::Win32::System::Threading::GetCurrentProcessId() },
+            is_explicit_owner: true,
+        };
+        let (_, _, exe, path, explicit) =
+            super::resolve_captured_source_app_info(super::capture_source_app(Some(identity)));
+        assert!(explicit);
+        assert_eq!(
+            exe.as_deref(),
+            expected.file_name().and_then(|name| name.to_str())
+        );
+        assert_eq!(path.map(std::path::PathBuf::from).as_ref(), Some(&expected));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_source_lookup_preserves_actual_clipboard_ownership() {
+        for explicit in [true, false] {
+            let identity = super::SourceAppIdentity {
+                process_id: 0,
+                is_explicit_owner: explicit,
+            };
+            let (_, _, exe, path, observed_explicit) =
+                super::resolve_captured_source_app_info(super::capture_source_app(Some(identity)));
+            assert!(exe.is_none());
+            assert!(path.is_none());
+            assert_eq!(observed_explicit, explicit);
+            assert!(!is_remote_client_owner(exe.as_deref(), observed_explicit));
+        }
     }
 
     #[test]
@@ -4409,8 +5241,18 @@ mod tests {
         // KeePass through mstsc forwards its own Clipboard Viewer Ignore tag.
         // That one describes the content, so a remote owner is no reason to
         // store a password Settings said would not be saved (SBS-1000).
-        assert!(should_skip_sensitive_capture(true, OWNER_MARKED, true));
-        assert!(should_skip_sensitive_capture(true, OWNER_MARKED, false));
+        assert!(should_skip_sensitive_capture(
+            true,
+            OWNER_MARKED,
+            true,
+            false
+        ));
+        assert!(should_skip_sensitive_capture(
+            true,
+            OWNER_MARKED,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -4420,6 +5262,7 @@ mod tests {
         assert!(should_skip_sensitive_capture(
             true,
             MONITOR_EXCLUSION,
+            false,
             false
         ));
     }
@@ -4429,13 +5272,20 @@ mod tests {
         assert!(!should_skip_sensitive_capture(
             true,
             SensitiveMarkers::default(),
+            false,
             false
         ));
-        assert!(!should_skip_sensitive_capture(false, OWNER_MARKED, false));
+        assert!(!should_skip_sensitive_capture(
+            false,
+            OWNER_MARKED,
+            false,
+            false
+        ));
         assert!(!should_skip_sensitive_capture(
             false,
             MONITOR_EXCLUSION,
-            true
+            true,
+            false
         ));
     }
 
