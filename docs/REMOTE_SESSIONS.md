@@ -65,10 +65,21 @@ to ordinary Windows applications.
 
 ## Other remote clients
 
-Cubby recognizes Windows Remote Desktop, AnyDesk, TeamViewer, ScreenConnect,
+Cubby recognizes Windows Remote Desktop, mRemoteNG, AnyDesk, TeamViewer, ScreenConnect,
 Splashtop, and RustDesk. These clients currently use focus restoration followed
 by Cubby's standard Ctrl+V compatibility path. Each client should be validated
 individually because forwarding and clipboard policies vary.
+
+Capture, paste strategy, and the hotkey helper share the same executable
+classification. mRemoteNG hosts RDP in `mRemoteNG.exe`; treating only
+`mstsc.exe` as RDP misses that owner. A recognized remote owner's blanket
+`ExcludeClipboardContentFromMonitorProcessing` marker does not suppress history,
+while content-owner privacy markers and the ignored-app setting still apply.
+
+For mRemoteNG, enable **Redirect Clipboard** on the connection. If a remote
+copy cannot paste into a local application, clipboard redirection has not made
+the content available to Cubby. See the [mRemoteNG acceptance run](MREMOTENG_CAPTURE_ACCEPTANCE.md)
+for the checks needed to confirm this integration on Windows.
 
 ## Testing
 

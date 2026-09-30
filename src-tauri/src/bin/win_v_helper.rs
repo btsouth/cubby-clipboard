@@ -429,20 +429,7 @@ mod windows_helper {
     }
 
     fn is_supported_remote_process(process_name: &str) -> bool {
-        matches!(
-            process_name.to_ascii_lowercase().as_str(),
-            "ncplayer.exe"
-                | "mstsc.exe"
-                | "msrdc.exe"
-                | "anydesk.exe"
-                | "teamviewer.exe"
-                | "teamviewer_desktop.exe"
-                | "screenconnect.clientservice.exe"
-                | "screenconnect.windowsclient.exe"
-                | "splashtop.exe"
-                | "strwinclt.exe"
-                | "rustdesk.exe"
-        )
+        cubby::remote_clients::classify_remote_process(process_name).is_some()
     }
 
     fn foreground_is_supported_remote() -> bool {
@@ -818,6 +805,7 @@ mod windows_helper {
         fn recognizes_supported_remote_clients() {
             assert!(is_supported_remote_process("ncplayer.exe"));
             assert!(is_supported_remote_process("MSTSC.EXE"));
+            assert!(is_supported_remote_process("mRemoteNG.exe"));
             assert!(is_supported_remote_process("rustdesk.exe"));
             assert!(!is_supported_remote_process("notepad.exe"));
         }

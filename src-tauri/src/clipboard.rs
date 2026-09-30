@@ -31,8 +31,6 @@ use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::CloseHandle;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::MAX_PATH;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -45,9 +43,9 @@ use windows::Win32::Storage::FileSystem::{
 #[cfg(target_os = "windows")]
 use windows::Win32::System::DataExchange::GetClipboardOwner;
 #[cfg(target_os = "windows")]
-use windows::Win32::System::ProcessStatus::{GetModuleBaseNameW, GetModuleFileNameExW};
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
@@ -1894,10 +1892,7 @@ fn write_image_clipboard_formats(prepared: &PreparedImageFormats<'_>) -> Result<
 /// writes whatever it received from the far end, so the metadata on that write
 /// describes the *viewer's* policy, not what the originating application meant.
 fn is_remote_client_process(exe_name: Option<&str>) -> bool {
-    exe_name.is_some_and(|exe| {
-        crate::paste_engine::paste_strategy_for_process(exe)
-            != crate::paste_engine::PasteStrategy::Standard
-    })
+    exe_name.is_some_and(|exe| crate::remote_clients::classify_remote_process(exe).is_some())
 }
 
 /// True when a remote client is the *attributed owner* of this clipboard write.
@@ -3327,18 +3322,23 @@ fn get_clipboard_owner_identity() -> Option<SourceAppIdentity> {
 
 #[cfg(target_os = "windows")]
 fn resolve_source_app_info(identity: Option<SourceAppIdentity>) -> SourceAppInfo {
+    use windows::core::PWSTR;
+
     unsafe {
         let Some(identity) = identity else {
             return (None, None, None, None, false);
         };
 
+        // Reading an executable path does not require access to its memory.
+        // The stronger rights can fail for elevated owners, hiding their remote
+        // classification and incorrectly turning their captures into ghosts.
         let process_handle = match OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            PROCESS_QUERY_LIMITED_INFORMATION,
             false,
             identity.process_id,
         ) {
             Ok(h) => h,
-            Err(_) => return (None, None, None, None, false),
+            Err(_) => return (None, None, None, None, identity.is_explicit_owner),
         };
         // OpenProcess returns a kernel handle. Every other capture path
         // (paste target, Win+V helper) CloseHandle's it; this one did not, so
@@ -3353,54 +3353,32 @@ fn resolve_source_app_info(identity: Option<SourceAppIdentity>) -> SourceAppInfo
         }
         let _process_guard = ProcessHandleGuard(process_handle);
 
-        let mut name_buffer = [0u16; MAX_PATH as usize];
-        let name_size = GetModuleBaseNameW(process_handle, None, &mut name_buffer);
-        let exe_name = if name_size > 0 {
-            String::from_utf16_lossy(&name_buffer[..name_size as usize])
-        } else {
-            String::new()
-        };
-
-        let mut path_buffer = [0u16; MAX_PATH as usize];
-        let path_size = GetModuleFileNameExW(Some(process_handle), None, &mut path_buffer);
-        let (app_name, app_icon, full_path) = if path_size > 0 {
-            let full_path_str = String::from_utf16_lossy(&path_buffer[..path_size as usize]);
-
-            let desc = get_app_description(&full_path_str);
-            let final_name = if let Some(d) = desc {
-                Some(d)
-            } else {
-                if !exe_name.is_empty() {
-                    Some(exe_name.clone())
-                } else {
-                    None
-                }
-            };
-
-            let icon = extract_icon(&full_path_str);
-            (final_name, icon, Some(full_path_str))
-        } else {
-            (
-                if !exe_name.is_empty() {
-                    Some(exe_name.clone())
-                } else {
-                    None
-                },
-                None,
-                None,
-            )
-        };
-
-        let exe_val = if !exe_name.is_empty() {
-            Some(exe_name)
-        } else {
-            None
-        };
+        let mut path_buffer = vec![0u16; 32768];
+        let mut path_size = path_buffer.len() as u32;
+        if QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(path_buffer.as_mut_ptr()),
+            &mut path_size,
+        )
+        .is_err()
+        {
+            // A failed metadata lookup does not undo GetClipboardOwner's
+            // explicit ownership. Privacy still has no remote bypass without
+            // a recognized executable; ordinary copies can still be stored.
+            return (None, None, None, None, identity.is_explicit_owner);
+        }
+        let full_path = String::from_utf16_lossy(&path_buffer[..path_size as usize]);
+        let exe_name = std::path::Path::new(&full_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let app_name = get_app_description(&full_path).or_else(|| exe_name.clone());
+        let app_icon = extract_icon(&full_path);
         (
             app_name,
             app_icon,
-            exe_val,
-            full_path,
+            exe_name,
+            Some(full_path),
             identity.is_explicit_owner,
         )
     }
@@ -4402,6 +4380,76 @@ mod tests {
             MONITOR_EXCLUSION,
             true
         ));
+    }
+
+    #[test]
+    fn mremoteng_history_and_relay_keep_the_existing_privacy_boundaries() {
+        for name in ["mRemoteNG.exe", "mremoteng.exe", "MREMOTENG.EXE"] {
+            let remote = is_remote_client_owner(Some(name), true);
+            assert!(remote);
+            assert!(!should_skip_sensitive_capture(
+                true,
+                MONITOR_EXCLUSION,
+                remote
+            ));
+            assert!(should_skip_sensitive_capture(true, OWNER_MARKED, remote));
+            assert!(should_skip_sensitive_capture(
+                true,
+                SensitiveMarkers {
+                    monitor_exclusion: true,
+                    content_owner: true
+                },
+                remote
+            ));
+            assert!(should_relay_capture(true, remote, false));
+            assert!(!should_relay_capture(false, remote, false));
+            assert!(!should_relay_capture(true, remote, true));
+
+            // A foreground mRemoteNG window is never evidence that an
+            // unattributed local password copy came from the remote session.
+            let foreground_only = is_remote_client_owner(Some(name), false);
+            assert!(!foreground_only);
+            assert!(should_skip_sensitive_capture(
+                true,
+                MONITOR_EXCLUSION,
+                foreground_only
+            ));
+            assert!(!should_relay_capture(true, foreground_only, false));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source_attribution_reads_executable_with_limited_process_rights() {
+        let expected = std::env::current_exe().unwrap();
+        let identity = super::SourceAppIdentity {
+            process_id: unsafe { windows::Win32::System::Threading::GetCurrentProcessId() },
+            is_explicit_owner: true,
+        };
+        let (_, _, exe, path, explicit) = super::resolve_source_app_info(Some(identity));
+        assert!(explicit);
+        assert_eq!(
+            exe.as_deref(),
+            expected.file_name().and_then(|name| name.to_str())
+        );
+        assert_eq!(path.map(std::path::PathBuf::from).as_ref(), Some(&expected));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_source_lookup_preserves_actual_clipboard_ownership() {
+        for explicit in [true, false] {
+            let identity = super::SourceAppIdentity {
+                process_id: 0,
+                is_explicit_owner: explicit,
+            };
+            let (_, _, exe, path, observed_explicit) =
+                super::resolve_source_app_info(Some(identity));
+            assert!(exe.is_none());
+            assert!(path.is_none());
+            assert_eq!(observed_explicit, explicit);
+            assert!(!is_remote_client_owner(exe.as_deref(), observed_explicit));
+        }
     }
 
     #[test]

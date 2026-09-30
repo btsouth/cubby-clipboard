@@ -62,6 +62,7 @@ Cubby must be exercised with:
 
 - Windows Remote Desktop Connection
 - Windows App / modern RDP client
+- mRemoteNG (embedded RDP, clipboard owned by `mRemoteNG.exe`)
 - NinjaOne remote access used in normal support workflows
 - At least one additional remote-control product with clipboard synchronization
 
@@ -84,6 +85,11 @@ For each client, test:
 - A capture failure is visible in local diagnostics and never silently reported as successful.
 
 These targets are a starting contract. Results from real applications and remote products should tighten the implementation and expand the regression suite.
+
+The [mRemoteNG acceptance run](MREMOTENG_CAPTURE_ACCEPTANCE.md) records the
+specific remote-history regression reported against v1.3.4 and the live checks
+that must pass before claiming that client's compatibility. Unit tests of
+classification and privacy policy do not substitute for that run.
 
 ## Capture probe
 
