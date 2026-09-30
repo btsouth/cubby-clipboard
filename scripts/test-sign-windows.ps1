@@ -218,14 +218,26 @@ function Invoke-ArtifactSigning {
     # fixture PIDs if an assertion failed before a handle could be recorded.
     foreach ($fixture in Get-ChildItem -LiteralPath $testDirectory -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in @('.root', '.child') }) {
+        $process = $null
         try {
             $process = [System.Diagnostics.Process]::GetProcessById([int][System.IO.File]::ReadAllText($fixture.FullName))
             if (-not $process.HasExited -and $process.MainModule.FileName -eq $signerPath) { $process.Kill($true) }
-            $process.Dispose()
-        } catch [System.ArgumentException] { }
+        } catch [System.ArgumentException] {
+            # The fixture process already exited.
+        } catch {
+            # A reused PID or exit race must not prevent cleanup of other fixtures
+            # or replace the assertion failure that brought us into finally.
+            Write-Warning "Skipped fixture cleanup for $($fixture.Name): $($_.Exception.Message)"
+        } finally {
+            if ($null -ne $process) { $process.Dispose() }
+        }
     }
     foreach ($process in $ownedTestProcesses) {
-        try { if (-not $process.HasExited) { $process.Kill($true) } } finally { $process.Dispose() }
+        try {
+            if (-not $process.HasExited) { $process.Kill($true) }
+        } catch {
+            Write-Warning "Skipped cleanup for PID $($process.Id): $($_.Exception.Message)"
+        } finally { $process.Dispose() }
     }
     Remove-Item -LiteralPath $testDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }

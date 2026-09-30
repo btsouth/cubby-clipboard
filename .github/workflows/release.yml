@@ -242,6 +242,19 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # A cold compile can outlast the GitHub OIDC assertion. Cache this resource
+      # immediately while it is fresh; AzureCliCredential can then use the
+      # longer-lived signing access token without another assertion exchange.
+      # --output none keeps the token out of the log.
+      # https://github.com/Azure/login/issues/372#issuecomment-2056289617
+      - name: Cache the Artifact Signing access token
+        shell: pwsh
+        run: |
+          az account get-access-token --resource https://codesigning.azure.net --output none
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not cache the Artifact Signing access token."
+          }
+
       # Same module (and version) that Azure/artifact-signing-action@v2
       # installs for the post-build signing steps below, so in-build and
       # post-build signing share one mechanism. Installed once here rather than
