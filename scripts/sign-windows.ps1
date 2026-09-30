@@ -42,7 +42,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Path
+    [string]$Path,
+
+    [ValidateRange(1, 3600)]
+    [int]$SigningTimeoutSeconds = 300
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,6 +73,57 @@ function Stop-WithError {
 
     Write-SignLog "ERROR: $Message"
     throw "sign-windows: $Message"
+}
+
+# ArtifactSigning 0.1.8's timeout ends Wait-Process but leaves signtool running.
+# Its inherited stdout/stderr handles can then keep Tauri's captured-output
+# wait open after this pwsh process fails. Kill only new signtool children of
+# this invocation, including their descendants; never sweep by process name.
+function Stop-OwnedSignToolTrees {
+    param([datetime]$StartedAt)
+
+    $roots = @(Get-CimInstance -ClassName Win32_Process `
+        -Filter "ParentProcessId = $PID AND Name = 'signtool.exe'" -ErrorAction Stop)
+    foreach ($root in $roots) {
+        if ($null -eq $root.CreationDate) {
+            throw "Cannot establish creation time for owned signtool PID $($root.ProcessId)."
+        }
+        $createdAt = ([datetime]$root.CreationDate).ToUniversalTime()
+        if ($createdAt -lt $StartedAt) {
+            continue
+        }
+
+        $process = $null
+        try {
+            try {
+                $process = [System.Diagnostics.Process]::GetProcessById([int]$root.ProcessId)
+                $null = $process.Handle
+            } catch [System.ArgumentException] {
+                continue # The signer exited between enumeration and opening it.
+            }
+            if ($process.HasExited) {
+                continue
+            }
+            # Hold the opened process handle and verify its start time, so a
+            # reused PID cannot turn a stale CIM record into somebody else's kill.
+            $openedAt = $process.StartTime.ToUniversalTime()
+            if ($process.ProcessName -ne 'signtool' -or
+                [Math]::Abs(($openedAt - $createdAt).TotalMilliseconds) -gt 1) {
+                throw "Identity changed for owned signtool PID $($root.ProcessId); refusing cleanup."
+            }
+            Write-SignLog "terminating owned signtool PID $($root.ProcessId) and its descendants"
+            try {
+                $process.Kill($true)
+            } catch [System.InvalidOperationException] {
+                if (-not $process.HasExited) { throw }
+            }
+            if (-not $process.WaitForExit(5000)) {
+                throw "Owned signtool PID $($root.ProcessId) did not exit after termination."
+            }
+        } finally {
+            if ($null -ne $process) { $process.Dispose() }
+        }
+    }
 }
 
 $endpoint = $env:ARTIFACT_SIGNING_ENDPOINT
@@ -116,7 +170,11 @@ Write-SignLog "signing $resolved"
 # SmartScreen prompts. Without them Windows falls back to the bare file name.
 # Digest and timestamp settings mirror the post-build signing step in
 # release.yml so every shipped artifact carries the same signature shape.
+$signingStartedAt = [datetime]::UtcNow
 try {
+    # Match Azure/artifact-signing-action v2's defaults. CI authenticates through
+    # azure/login's Azure CLI session; unrelated developer/VM/browser credentials
+    # must not delay it or open an interactive login on the build runner.
     Invoke-ArtifactSigning `
         -Endpoint $endpoint `
         -CodeSigningAccountName $account `
@@ -126,15 +184,30 @@ try {
         -TimestampRfc3161 "http://timestamp.acs.microsoft.com" `
         -TimestampDigest "SHA256" `
         -Description "Cubby Clipboard" `
-        -DescriptionUrl "https://cubbyclipboard.com"
+        -DescriptionUrl "https://cubbyclipboard.com" `
+        -Timeout $SigningTimeoutSeconds `
+        -ExcludeWorkloadIdentityCredential `
+        -ExcludeManagedIdentityCredential `
+        -ExcludeSharedTokenCacheCredential `
+        -ExcludeVisualStudioCredential `
+        -ExcludeVisualStudioCodeCredential `
+        -ExcludeAzurePowerShellCredential `
+        -ExcludeAzureDeveloperCliCredential `
+        -ExcludeInteractiveBrowserCredential
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $resolved
+    if ($signature.Status -ne "Valid") {
+        throw "$resolved is '$($signature.Status)' after signing: $($signature.StatusMessage)"
+    }
 }
 catch {
-    Stop-WithError "Invoke-ArtifactSigning failed for ${resolved}: $($_.Exception.Message)"
-}
-
-$signature = Get-AuthenticodeSignature -LiteralPath $resolved
-if ($signature.Status -ne "Valid") {
-    Stop-WithError "$resolved is '$($signature.Status)' after signing: $($signature.StatusMessage)"
+    $signingFailure = $_.Exception.Message
+    try {
+        Stop-OwnedSignToolTrees -StartedAt $signingStartedAt
+    } catch {
+        Stop-WithError "signing failed for ${resolved}: $signingFailure Cleanup also failed: $($_.Exception.Message)"
+    }
+    Stop-WithError "signing failed for ${resolved}: $signingFailure"
 }
 
 Write-SignLog "signed $resolved ($($signature.SignerCertificate.Subject))"
