@@ -307,10 +307,19 @@ fn decode_unicode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{decode_unicode, on_reader_thread, ReadFailure};
+    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
+
+    // These tests deliberately abandon the process-wide WORKER. Keep each
+    // timeout/reuse scenario intact: another test must not replace its healthy
+    // worker between the two reads whose thread identities are compared.
+    static READER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn a_read_stuck_past_the_timeout_is_abandoned_for_a_fresh_reader_thread() {
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let (stuck_on, stuck_thread) = std::sync::mpsc::channel();
         let stuck = on_reader_thread(
             move |_| {
@@ -337,6 +346,9 @@ mod tests {
 
     #[test]
     fn reads_that_keep_finishing_are_not_mistaken_for_a_frozen_owner() {
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Eight slow formats take longer than the limit in total, but each one
         // finishes well within it.
         let finished = on_reader_thread(
@@ -354,6 +366,9 @@ mod tests {
 
     #[test]
     fn an_owner_that_stops_rendering_after_some_progress_still_times_out() {
+        let _guard = READER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let stalled = on_reader_thread(
             |progress| {
                 progress();
