@@ -74,7 +74,21 @@ Capture, paste strategy, and the hotkey helper share the same executable
 classification. mRemoteNG hosts RDP in `mRemoteNG.exe`; treating only
 `mstsc.exe` as RDP misses that owner. A recognized remote owner's blanket
 `ExcludeClipboardContentFromMonitorProcessing` marker does not suppress history,
-while content-owner privacy markers and the ignored-app setting still apply.
+while `Clipboard Viewer Ignore` and the ignored-app setting still apply.
+
+The Windows RDP control also adds `CanIncludeInClipboardHistory = 0` and
+`CanUploadToCloudClipboard = 0` to ordinary remote copies. Cubby retains those
+copies when the actual owner is mRemoteNG, mstsc, or msrdc, and leaves the
+Windows clipboard flags untouched. The same pair from a local application or a
+different remote client remains excluded with Skip sensitive enabled; an
+isolated history opt-out also remains excluded. Foreground attribution never
+qualifies for an exception.
+
+RDP's blanket pair cannot distinguish an ordinary remote copy from a source
+application's identical opt-outs. Skip sensitive therefore cannot promise to
+exclude every remote password. A forwarded `Clipboard Viewer Ignore` marker
+still excludes it. Use Ignored Apps to exclude the remote client entirely, or
+Skip likely secrets for Cubby's separate content-based filtering.
 
 For mRemoteNG, enable **Redirect Clipboard** on the connection. If a remote
 copy cannot paste into a local application, clipboard redirection has not made

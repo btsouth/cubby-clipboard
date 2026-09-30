@@ -513,7 +513,7 @@ export function PrivacyTab({ settings, updateSetting, onRetentionChange }: Priva
             <Row
               title={'Skip passwords and sensitive copies'}
               desc={
-                "When an app such as a password manager marks a copy as sensitive, Cubby won't save it (Windows' own clipboard history does the same) and won't relay it between remote sessions. Turn this off to capture everything, including passwords."
+                'Skip copies with explicit privacy markers, including those from password managers. Remote Desktop adds the same Windows history flags to every copy, so Cubby can still save remote copies. Add the remote client to Ignored Apps to exclude them. Turn this off to capture app-marked passwords.'
               }
               control={
                 <Toggle

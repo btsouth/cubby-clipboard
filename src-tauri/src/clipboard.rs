@@ -1491,6 +1491,8 @@ fn read_clipboard_image(
 /// BI_BITFIELDS headers, although those masks are already inside the header.
 /// Supply an explicit BMP pixel offset for these packed DIBs. Keep the existing
 /// decoder/encoder for pixel and hash compatibility, without discarding alpha.
+/// System.Drawing's RDP bitmap also repeats the three RGB masks after its V5
+/// header. Recognize that exact layout rather than decoding the masks as pixels.
 #[cfg(target_os = "windows")]
 pub(crate) fn decode_clipboard_dib(
     mut bytes: Vec<u8>,
@@ -1507,11 +1509,25 @@ pub(crate) fn decode_clipboard_dib(
         // Packed clipboard DIBs place pixels after the header and color table;
         // a V5 embedded profile follows the pixels, not the other way around.
         let colors = dword(32).ok_or("truncated DIB header")?;
-        let offset = colors
+        let mut offset = colors
             .checked_mul(4)
             .and_then(|n| n.checked_add(header_size))
             .filter(|&n| n as usize <= bytes.len())
             .ok_or("invalid DIB color table")?;
+        let image_bytes = dword(20).unwrap_or(0);
+        if colors == 0
+            && image_bytes != 0
+            && (header_size != 124 || (dword(112) == Some(0) && dword(116) == Some(0)))
+            && offset
+                .checked_add(12)
+                .and_then(|n| n.checked_add(image_bytes))
+                .is_some_and(|n| n as usize == bytes.len())
+            && bytes.get(offset as usize..offset as usize + 12) == bytes.get(40..52)
+        {
+            // The live RDP fixture has exactly header + repeated masks +
+            // biSizeImage bytes. A normal packed V4/V5 still starts at header.
+            offset += 12;
+        }
         let file_size = u32::try_from(bytes.len())
             .ok()
             .and_then(|n| n.checked_add(14))
@@ -3654,6 +3670,20 @@ pub use capture_probe::run_capture_probe;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_system_drawing_bitmaps_keep_original_pixels() {
+        // Captured from System.Drawing through a real mRemoteNG RDP session.
+        // This V5 repeats its RGB masks outside the header as well as inside.
+        let dib = include_bytes!("../tests/fixtures/rdp-system-drawing-v5.dib");
+        let image = super::decode_clipboard_dib(dib.to_vec()).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 2));
+        assert_eq!(
+            image.to_rgba8().as_raw(),
+            &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn packed_v4_and_v5_bitfields_keep_exact_pixels_and_alpha() {
