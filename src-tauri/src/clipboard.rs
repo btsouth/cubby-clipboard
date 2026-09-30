@@ -454,26 +454,33 @@ fn release_ignore_for_dropped_events(evicted: &[ClipboardListenerEvent]) {
 /// A remote-control viewer sets the first on *everything* it forwards, because
 /// it cannot know what the far-end application meant. Honoring that dropped
 /// every remote-session copy and left a hole in history that reads as lost
-/// data (SBS-781). The other two are set by the application that owns the
-/// secret and are forwarded unchanged, so they still describe the content when
-/// it arrives over RDP — KeePass through mstsc has to keep being honored
-/// (SBS-1000). Keeping them apart is what lets both be true.
+/// data (SBS-781). Windows RDP also adds `CanIncludeInClipboardHistory = 0`
+/// together with `CanUploadToCloudClipboard = 0` to ordinary redirected text.
+/// Those transport tags cannot identify an originating application's intent.
+/// `Clipboard Viewer Ignore` remains an explicit content exclusion, including
+/// when forwarded through RDP (SBS-1000).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SensitiveMarkers {
     /// `ExcludeClipboardContentFromMonitorProcessing`. A blanket tag: trusted
     /// from a local application, not from a viewer relaying someone else's
     /// clipboard.
     monitor_exclusion: bool,
-    /// `Clipboard Viewer Ignore`, or `CanIncludeInClipboardHistory` = 0. Set by
-    /// the application that owns the content, so it survives the trip.
+    /// `Clipboard Viewer Ignore`, an explicit content exclusion.
     content_owner: bool,
+    /// `CanIncludeInClipboardHistory` = 0. Also synthesized by Windows RDP.
+    history_exclusion: bool,
+    /// `CanUploadToCloudClipboard` = 0. The paired RDP transport marker.
+    cloud_exclusion: bool,
 }
 
 impl SensitiveMarkers {
     /// Any marker at all. Drives the marker Cubby re-applies when it rewrites
     /// the clipboard, which must not silently drop a tag that was there.
     fn any(self) -> bool {
-        self.monitor_exclusion || self.content_owner
+        self.monitor_exclusion
+            || self.content_owner
+            || self.history_exclusion
+            || self.cloud_exclusion
     }
 }
 
@@ -485,8 +492,9 @@ fn clipboard_marked_sensitive() -> SensitiveMarkers {
         monitor_exclusion: clipboard_format_available(
             "ExcludeClipboardContentFromMonitorProcessing",
         ),
-        content_owner: clipboard_format_available("Clipboard Viewer Ignore")
-            || clipboard_history_opted_out(),
+        content_owner: clipboard_format_available("Clipboard Viewer Ignore"),
+        history_exclusion: clipboard_dword_opted_out("CanIncludeInClipboardHistory"),
+        cloud_exclusion: clipboard_dword_opted_out("CanUploadToCloudClipboard"),
     }
 }
 
@@ -503,16 +511,13 @@ fn clipboard_format_available(name: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn clipboard_history_opted_out() -> bool {
+fn clipboard_dword_opted_out(name: &str) -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 
-    let utf16: Vec<u16> = "CanIncludeInClipboardHistory"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let utf16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let format = unsafe { RegisterClipboardFormatW(PCWSTR(utf16.as_ptr())) };
-    if format == 0 || !clipboard_format_available("CanIncludeInClipboardHistory") {
+    if format == 0 || !clipboard_format_available(name) {
         return false;
     }
     // raw::get reads through GetClipboardData, which returns nothing unless
@@ -520,7 +525,7 @@ fn clipboard_history_opted_out() -> bool {
     // readable, so the marker silently never fired. The open is gated on the
     // presence check above, so only apps that set the format pay for it.
     let Ok(_clipboard) = clipboard_win::Clipboard::new_attempts(10) else {
-        log::debug!("CLIPBOARD: Could not open the clipboard to read CanIncludeInClipboardHistory");
+        log::debug!("CLIPBOARD: Could not open the clipboard to read {name}");
         return false;
     };
     let mut buffer = [0_u8; 4];
@@ -1907,6 +1912,14 @@ fn is_remote_client_owner(exe_name: Option<&str>, is_explicit_owner: bool) -> bo
     is_explicit_owner && is_remote_client_process(exe_name)
 }
 
+fn is_rdp_client_owner(exe_name: Option<&str>, is_explicit_owner: bool) -> bool {
+    is_explicit_owner
+        && exe_name.is_some_and(|exe| {
+            crate::remote_clients::classify_remote_process(exe)
+                == Some(crate::remote_clients::RemoteClient::Rdp)
+        })
+}
+
 /// Relay only captures owned by a remote-control viewer.
 ///
 /// Sensitive-tagged content is relayed too, because a remote client tags
@@ -1925,18 +1938,22 @@ fn should_relay_capture(relay_enabled: bool, remote_client: bool, app_ignored: b
 
 /// Whether a sensitive-tagged capture should be dropped instead of stored.
 ///
-/// An owner-set marker describes the content, so it is honored wherever the
-/// content came from: KeePass forwarded through a remote viewer must not be
-/// stored when Settings says it will not be (SBS-1000). A viewer's blanket
-/// monitor-exclusion tag describes the viewer, not the content, so it is
-/// honored from a local application and ignored from a recognized remote
-/// client — otherwise every remote-session copy disappears (SBS-781).
+/// Explicit exclusions still apply to local apps and forwarded KeePass copies.
+/// The paired Windows history/cloud DWORDs are a blanket transport policy when
+/// the actual owner is a recognized RDP client. RDP supplies the same pair for
+/// untagged text, so it cannot establish a remote source's privacy intent.
+/// Neither exception applies to foreground-only attribution.
 fn should_skip_sensitive_capture(
     skip_sensitive: bool,
     markers: SensitiveMarkers,
     remote_client: bool,
+    rdp_client: bool,
 ) -> bool {
-    skip_sensitive && (markers.content_owner || (markers.monitor_exclusion && !remote_client))
+    let rdp_transport = remote_client && rdp_client && markers.cloud_exclusion;
+    skip_sensitive
+        && (markers.content_owner
+            || (markers.history_exclusion && !rdp_transport)
+            || (markers.monitor_exclusion && !remote_client))
 }
 
 /// Outcome of the skip-likely-secrets capture gate.
@@ -2358,6 +2375,7 @@ async fn process_clipboard_snapshot(
     };
 
     let remote_client = is_remote_client_owner(exe_name.as_deref(), is_explicit_owner);
+    let rdp_client = is_rdp_client_owner(exe_name.as_deref(), is_explicit_owner);
 
     // Resolved before the relay because an ignored application is excluded from
     // transport too, not just from history.
@@ -2383,8 +2401,16 @@ async fn process_clipboard_snapshot(
     // emptied the clipboard and republished text/html/rtf only, which stripped
     // do-not-retain markers and Office private formats (SBS-1001). Content the
     // owning application tagged is never rewritten.
-    if should_skip_sensitive_capture(settings.skip_sensitive, markers, remote_client) {
-        log::info!("CLIPBOARD: Skipping content the source app marked as sensitive");
+    if should_skip_sensitive_capture(settings.skip_sensitive, markers, remote_client, rdp_client) {
+        log::info!(
+            "CLIPBOARD: Skipping sensitive content (viewer_ignore={}, history_exclusion={}, cloud_exclusion={}, monitor_exclusion={}, remote_owner={}, rdp_owner={})",
+            markers.content_owner,
+            markers.history_exclusion,
+            markers.cloud_exclusion,
+            markers.monitor_exclusion,
+            remote_client,
+            rdp_client
+        );
         discard_clear_target();
         return;
     }
@@ -2419,13 +2445,14 @@ async fn process_clipboard_snapshot(
     // `false` for app_ignored: the ignored-application return above already
     // ran, so nothing ignored reaches here.
     //
-    // An owner-marked copy is never republished — the rewrite carries only
-    // text/html/rtf plus the monitor-exclusion tag, so relaying KeePass would
-    // strip the very marker that protects it (SBS-1001). A viewer's blanket
-    // tag is re-applied on the way out, which is what keeps remote-session
-    // copies flowing (SBS-781).
+    // Never rewrite history/cloud opt-outs, including the RDP transport pair.
+    // Capturing for Cubby's local history does not grant permission to remove
+    // Windows' history/cloud policy. Explicit content exclusions likewise stay
+    // untouched (SBS-1001). The viewer's monitor-only tag can be re-applied.
     if should_relay_capture(settings.remote_clipboard_relay, remote_client, false)
         && !markers.content_owner
+        && !markers.history_exclusion
+        && !markers.cloud_exclusion
     {
         relay_remote_capture(
             clip_type,
@@ -4345,7 +4372,8 @@ mod tests {
         assert!(should_skip_sensitive_capture(
             true,
             MONITOR_EXCLUSION,
-            is_remote_client_owner(Some("ncplayer.exe"), false)
+            is_remote_client_owner(Some("ncplayer.exe"), false),
+            false
         ));
     }
 
@@ -4353,11 +4381,15 @@ mod tests {
     const MONITOR_EXCLUSION: SensitiveMarkers = SensitiveMarkers {
         monitor_exclusion: true,
         content_owner: false,
+        history_exclusion: false,
+        cloud_exclusion: false,
     };
     /// What KeePass and friends set about content they own.
     const OWNER_MARKED: SensitiveMarkers = SensitiveMarkers {
         monitor_exclusion: false,
         content_owner: true,
+        history_exclusion: false,
+        cloud_exclusion: false,
     };
 
     #[cfg(target_os = "windows")]
@@ -4378,7 +4410,8 @@ mod tests {
         assert!(!should_skip_sensitive_capture(
             true,
             MONITOR_EXCLUSION,
-            true
+            true,
+            false
         ));
     }
 
@@ -4390,16 +4423,24 @@ mod tests {
             assert!(!should_skip_sensitive_capture(
                 true,
                 MONITOR_EXCLUSION,
-                remote
+                remote,
+                false
             ));
-            assert!(should_skip_sensitive_capture(true, OWNER_MARKED, remote));
+            assert!(should_skip_sensitive_capture(
+                true,
+                OWNER_MARKED,
+                remote,
+                false
+            ));
             assert!(should_skip_sensitive_capture(
                 true,
                 SensitiveMarkers {
                     monitor_exclusion: true,
-                    content_owner: true
+                    content_owner: true,
+                    ..SensitiveMarkers::default()
                 },
-                remote
+                remote,
+                false
             ));
             assert!(should_relay_capture(true, remote, false));
             assert!(!should_relay_capture(false, remote, false));
@@ -4412,10 +4453,75 @@ mod tests {
             assert!(should_skip_sensitive_capture(
                 true,
                 MONITOR_EXCLUSION,
-                foreground_only
+                foreground_only,
+                false
             ));
             assert!(!should_relay_capture(true, foreground_only, false));
         }
+    }
+
+    #[test]
+    fn ordinary_rdp_copies_with_paired_history_and_cloud_opt_outs_are_retained() {
+        // Observed on an actual mRemoteNG RDP connection: neither DWORD was
+        // present at the source, but the client supplied both as zero.
+        let transport = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..SensitiveMarkers::default()
+        };
+        for name in ["mRemoteNG.exe", "MSTSC.EXE", "msrdc.exe"] {
+            for explicit in [true, false] {
+                let remote = is_remote_client_owner(Some(name), explicit);
+                let rdp = super::is_rdp_client_owner(Some(name), explicit);
+                assert_eq!(
+                    should_skip_sensitive_capture(true, transport, remote, rdp),
+                    !explicit,
+                    "{name}, explicit={explicit}"
+                );
+                assert!(should_skip_sensitive_capture(
+                    true,
+                    SensitiveMarkers {
+                        content_owner: true,
+                        ..transport
+                    },
+                    remote,
+                    rdp
+                ));
+                // An isolated history denial is not the observed RDP pair.
+                assert!(should_skip_sensitive_capture(
+                    true,
+                    SensitiveMarkers {
+                        cloud_exclusion: false,
+                        ..transport
+                    },
+                    remote,
+                    rdp
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn paired_history_and_cloud_opt_outs_are_still_honored_outside_rdp() {
+        let markers = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..SensitiveMarkers::default()
+        };
+        for name in [
+            "notepad.exe",
+            "1Password.exe",
+            "ncplayer.exe",
+            "anydesk.exe",
+        ] {
+            assert!(should_skip_sensitive_capture(
+                true,
+                markers,
+                is_remote_client_owner(Some(name), true),
+                super::is_rdp_client_owner(Some(name), true)
+            ));
+        }
+        assert!(!should_skip_sensitive_capture(false, markers, false, false));
     }
 
     #[cfg(target_os = "windows")]
@@ -4457,8 +4563,18 @@ mod tests {
         // KeePass through mstsc forwards its own Clipboard Viewer Ignore tag.
         // That one describes the content, so a remote owner is no reason to
         // store a password Settings said would not be saved (SBS-1000).
-        assert!(should_skip_sensitive_capture(true, OWNER_MARKED, true));
-        assert!(should_skip_sensitive_capture(true, OWNER_MARKED, false));
+        assert!(should_skip_sensitive_capture(
+            true,
+            OWNER_MARKED,
+            true,
+            false
+        ));
+        assert!(should_skip_sensitive_capture(
+            true,
+            OWNER_MARKED,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -4468,6 +4584,7 @@ mod tests {
         assert!(should_skip_sensitive_capture(
             true,
             MONITOR_EXCLUSION,
+            false,
             false
         ));
     }
@@ -4477,13 +4594,20 @@ mod tests {
         assert!(!should_skip_sensitive_capture(
             true,
             SensitiveMarkers::default(),
+            false,
             false
         ));
-        assert!(!should_skip_sensitive_capture(false, OWNER_MARKED, false));
+        assert!(!should_skip_sensitive_capture(
+            false,
+            OWNER_MARKED,
+            false,
+            false
+        ));
         assert!(!should_skip_sensitive_capture(
             false,
             MONITOR_EXCLUSION,
-            true
+            true,
+            false
         ));
     }
 

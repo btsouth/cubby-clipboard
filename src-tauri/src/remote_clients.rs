@@ -5,6 +5,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteClient {
     Generic,
+    Rdp,
     Ninja,
 }
 
@@ -13,12 +14,16 @@ pub fn classify_remote_process(process_name: &str) -> Option<RemoteClient> {
         return Some(RemoteClient::Ninja);
     }
 
+    if ["mstsc.exe", "msrdc.exe", "mremoteng.exe"]
+        .iter()
+        .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+    {
+        // The Windows RDP control adds history/cloud opt-outs to ordinary
+        // redirected copies. mRemoteNG hosts that control in its own process.
+        return Some(RemoteClient::Rdp);
+    }
+
     if [
-        "mstsc.exe",
-        "msrdc.exe",
-        // mRemoteNG hosts the Microsoft RDP control in its own process, so
-        // its clipboard owner and foreground window are not mstsc.exe.
-        "mremoteng.exe",
         "anydesk.exe",
         "teamviewer.exe",
         "teamviewer_desktop.exe",
@@ -44,7 +49,7 @@ mod tests {
     #[test]
     fn recognizes_mremoteng_including_windows_filename_casing() {
         for name in ["mRemoteNG.exe", "mremoteng.exe", "MREMOTENG.EXE"] {
-            assert_eq!(classify_remote_process(name), Some(RemoteClient::Generic));
+            assert_eq!(classify_remote_process(name), Some(RemoteClient::Rdp));
         }
     }
 
@@ -55,8 +60,6 @@ mod tests {
             Some(RemoteClient::Ninja)
         );
         for name in [
-            "MSTSC.EXE",
-            "msrdc.exe",
             "anydesk.exe",
             "teamviewer.exe",
             "teamviewer_desktop.exe",
@@ -71,6 +74,9 @@ mod tests {
                 Some(RemoteClient::Generic),
                 "{name}"
             );
+        }
+        for name in ["MSTSC.EXE", "msrdc.exe"] {
+            assert_eq!(classify_remote_process(name), Some(RemoteClient::Rdp));
         }
     }
 

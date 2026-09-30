@@ -111,7 +111,7 @@ pub fn paste_strategy_for_process(process_name: &str) -> PasteStrategy {
     use crate::remote_clients::{classify_remote_process, RemoteClient};
     match classify_remote_process(process_name) {
         Some(RemoteClient::Ninja) => PasteStrategy::NinjaRemote,
-        Some(RemoteClient::Generic) => PasteStrategy::RemoteSession,
+        Some(RemoteClient::Generic | RemoteClient::Rdp) => PasteStrategy::RemoteSession,
         None => PasteStrategy::Standard,
     }
 }
