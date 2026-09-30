@@ -509,13 +509,21 @@ fn captured_clip_hash(content: &CapturedContent, formats: &[CapturedFormat]) -> 
         CapturedContent::Text { content, .. } => ("text", content.as_slice()),
         CapturedContent::Image { png_bytes, .. } => ("image", png_bytes.as_slice()),
     };
-    calculate_hash(&build_clip_hash_material(
-        clip_type,
-        primary,
-        formats
-            .iter()
-            .map(|format| (format.name, format.content.as_slice())),
-    ))
+    // Stream the same identity as build_clip_hash_material without allocating
+    // and copying another combined text/HTML/RTF buffer for every RDP sample.
+    let mut hasher = Sha256::new();
+    hasher.update(clip_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(primary);
+    if clip_type != "image" {
+        for format in formats {
+            hasher.update([0]);
+            hasher.update(format.name.as_bytes());
+            hasher.update([0]);
+            hasher.update(&format.content);
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// SBS-1039: a flood-evicted snapshot never reaches
@@ -4505,6 +4513,32 @@ mod tests {
             captured_clip_hash(&image, &formats),
             calculate_hash(&build_clip_hash_material("image", &png, std::iter::empty()))
         );
+        let unicode = "Unicode résumé 🔑\n".repeat(50_000).into_bytes();
+        let large = CapturedContent::Text {
+            content: unicode.clone(),
+            preview: "Unicode".into(),
+            hash: "unused".into(),
+        };
+        let rich = [
+            CapturedFormat {
+                name: "html",
+                content: b"<b>Unicode</b>".repeat(50_000),
+            },
+            CapturedFormat {
+                name: "rtf",
+                content: b"{\\rtf1 Unicode}".repeat(50_000),
+            },
+        ];
+        for formats in [&rich[..], &rich[..0]] {
+            assert_eq!(
+                captured_clip_hash(&large, formats),
+                calculate_hash(&build_clip_hash_material(
+                    "text",
+                    &unicode,
+                    formats.iter().map(|f| (f.name, f.content.as_slice()))
+                ))
+            );
+        }
     }
 
     /// A kept image still stores a real generated thumbnail (SBS-1077).
