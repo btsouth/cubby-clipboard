@@ -3978,7 +3978,7 @@ mod tests {
             },
             |delay| elapsed.set(elapsed.get() + delay),
         )
-        .unwrap();
+        .unwrap_or_else(|_| panic!("transient privacy reads should recover"));
         assert!(observed.history_exclusion && observed.cloud_exclusion);
         assert!(elapsed.get() >= Duration::from_millis(200));
         let mut attempts = 0;
