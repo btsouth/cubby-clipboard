@@ -45,9 +45,10 @@ preserves ownership without inventing a remote classification.
 After a notification identifies an actual RDP owner, the listener also samples
 text every 40 ms through the existing OLE reader. Changed payloads are queued
 even when their sequence stays unchanged; unchanged samples are deduplicated
-before enqueue. Each sample rechecks ownership and privacy metadata. Local
-owners use notifications, images/files are not polled, and timed-out owners are
-not sampled again until a new sequence arrives. Startup does not import an
+before enqueue. Both notifications and samples recheck ownership and privacy metadata, and reread Unicode text after rich formats to reject a mixed copy. Sampling survives listener recreation. Local
+owners use notifications, images/files are not polled, and owners that time out or exhaust their retry budget are
+not sampled again until a new sequence arrives. Unreadable privacy DWORDs
+are retried through the bounded OLE worker and never treated as absent flags. Startup does not import an
 already-existing clipboard. Network latency, brief overwrites, and unreadable
 or unforwarded content still prevent a universal capture guarantee.
 
@@ -61,11 +62,16 @@ remote application's identical opt-outs. Skip sensitive cannot guarantee that
 all remote passwords are excluded. The settings description explains that
 remote copies can still be saved and that Ignored Apps excludes the client.
 
-The live image test also exposed a decoder defect in the current development
-build: System.Drawing's redirected V5 bitmap repeated three RGB masks after
-its header. Cubby read those masks as pixels. The fix recognizes the exact
-header/masks/image-size layout, preserves ordinary packed V4/V5 handling and
-alpha, and includes the captured synthetic bitmap as a regression fixture.
+The live image test exposed an existing decoder/transport ambiguity:
+System.Drawing's redirected V5 bitmap repeated three RGB masks after its
+header. A candidate byte-layout heuristic restored the synthetic pixels, but
+review reproduced corruption of a valid packed V5 with allocation padding.
+The companion CF_DIB was already altered too, so it could not independently
+establish the original pixels. That bitmap change was withdrawn. This release
+keeps the standard packed decoder, preserves the padded-image regression and
+both synthetic transport fixtures, and does **not** fix this image defect.
+The original-pixel fixture remains failed acceptance evidence; no passing
+image-fidelity test is claimed for this release.
 Previously damaged captures cannot be reconstructed from the damaged pixels.
 
 ## Completed Windows run
@@ -103,21 +109,37 @@ mRemoteNG and unelevated Cubby. The first 50-copy run preceded that UAC change.
 | Forwarded Clipboard Viewer Ignore | Excluded; subsequent ordinary remote copy accepted |
 | Local Viewer Ignore and history DWORD controls | Filtered; subsequent ordinary local copy accepted |
 | mRemoteNG in Ignored Apps | Remote fixture excluded; removing the setting restored capture |
-| RDP System.Drawing image | Initial pixel mismatch reproduced; fixed stored 2×2 image matches all four source pixels |
+| RDP System.Drawing image | Existing mismatch reproduced; heuristic candidate restored pixels, but withdrawn after review found valid padded-image corruption |
 | Earlier username after the password, RDP client closed | Exact paste into an empty local Windows rich text box |
 | Retained RTF, RDP client closed | Exact plain text and bold formatting pasted locally |
-| Retained image, RDP client closed | Restored Windows bitmap has all four exact source pixels |
+| Retained image from the withdrawn bitmap candidate, RDP client closed | Restored all four exact stored source pixels; final release bitmap capture is not validated |
 
 History checks read isolated, stopped database snapshots and compared decrypted
 payload bytes against supplied synthetic fixtures. They verified retention,
 not paste of every one of the 300 entries. Payloads and protected storage keys
-were not written to production logs. The actual bitmap regression fails with
-the old decoder and passes with the corrected decoder; existing packed V4/V5
-pixel and alpha regressions also pass.
+were not written to production logs. The image-fix candidate passed its source-pixel fixture but failed the independent
+padded-image review fixture, so it was withdrawn. Standard packed V4/V5 pixel,
+alpha, and allocation-padding regressions pass.
+
+## Adversarial review corrections
+
+Independent review found and corrected restart sampling loss, queued-source
+exit/PID lookup loss, mixed same-sequence rich reads, notification privacy
+recheck gaps, and exhausted polling retries. The padded-bitmap review finding caused the
+unverified image change to be withdrawn rather than shipped.
+Source executable/path are frozen during capture; icon/version metadata stay
+on the consumer. Privacy DWORD reads now share the bounded OLE worker and a
+failed read defers or records a failed capture instead of permitting relay.
+The reader timeout tests remain serialized around their shared worker.
+
+The coherence rechecks reduce race windows; they cannot reconstruct content
+that was overwritten before a read or prove atomic generations when the RDP
+transport supplies neither a sequence change nor an immutable data object.
 
 ## Remaining acceptance
 
 - Exact reporter environment and Ranger's clipboard behavior.
+- Nonstandard redirected V5 image layout and original-pixel provenance; existing defect remains.
 - Signed Microsoft Store installation/update over existing history.
 - Exact paste from every retained item, including rich and image destinations.
 - Local-to-remote and two-session interleaving, burst rates faster than the
