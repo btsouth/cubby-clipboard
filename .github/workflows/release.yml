@@ -57,6 +57,9 @@ jobs:
       - run: pnpm audit --prod
       - shell: pwsh
         run: ./scripts/audit-rust.ps1
+      - name: Signing credential and process cleanup rules
+        shell: pwsh
+        run: ./scripts/test-sign-windows.ps1
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       # dev-harness is enabled here (but never for release bundles) so the
       # feature-gated diagnostic binaries stay compiled and linted.
