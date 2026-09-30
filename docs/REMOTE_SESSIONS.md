@@ -84,6 +84,14 @@ different remote client remains excluded with Skip sensitive enabled; an
 isolated history opt-out also remains excluded. Foreground attribution never
 qualifies for an exception.
 
+Some RDP text changes are readable before another clipboard notification or
+sequence advance. After Windows announces a copy owned by a recognized RDP
+client, Cubby also samples its text every 40 ms, keeping changed payloads and
+deduplicating unchanged samples. Each sample rechecks ownership and privacy
+markers; local owners return to notification-driven capture. Sampling excludes
+images and files and stops on a timed-out owner until a new sequence arrives.
+It does not import the clipboard that existed before Cubby started.
+
 RDP's blanket pair cannot distinguish an ordinary remote copy from a source
 application's identical opt-outs. Skip sensitive therefore cannot promise to
 exclude every remote password. A forwarded `Clipboard Viewer Ignore` marker

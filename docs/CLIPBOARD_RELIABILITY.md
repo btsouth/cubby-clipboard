@@ -4,7 +4,7 @@ Clipboard capture is Cubby's primary product promise. A polished history UI is n
 
 ## Required behavior
 
-- Listen for Windows clipboard changes through the native notification mechanism rather than periodic polling.
+- Listen for Windows clipboard changes through native notifications. Supplement them with text sampling for an observed RDP owner whose delayed text can change without a notification or sequence advance.
 - Process clipboard sequence numbers in order and detect observable gaps.
 - Retry short-lived clipboard access contention with bounded backoff.
 - Enumerate every advertised clipboard format before choosing previews or normalized representations.
