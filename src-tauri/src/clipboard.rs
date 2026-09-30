@@ -608,7 +608,7 @@ fn clipboard_marked_sensitive() -> Result<SensitiveMarkers, crate::clipboard_rea
 
 #[cfg(target_os = "windows")]
 fn capture_sensitive_markers(sequence: u32) -> Result<SensitiveMarkers, CaptureAttempt> {
-    clipboard_marked_sensitive().map_err(|error| match error {
+    retry_sensitive_markers(clipboard_marked_sensitive, std::thread::sleep).map_err(|error| match error {
         crate::clipboard_reader::ReadFailure::Unresponsive => {
             note_clipboard_event(sequence);
             record_capture_error(format!("clipboard owner did not render privacy markers for sequence {sequence} within 30 s; that copy was not captured"));
@@ -617,6 +617,22 @@ fn capture_sensitive_markers(sequence: u32) -> Result<SensitiveMarkers, CaptureA
         crate::clipboard_reader::ReadFailure::Failed(_) =>
             defer_or_exhaust_capture(sequence, "privacy markers were unreadable"),
     })
+}
+
+#[cfg(target_os = "windows")]
+fn retry_sensitive_markers(
+    mut read: impl FnMut() -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure>,
+    mut pause: impl FnMut(Duration),
+) -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure> {
+    for attempt in 0..10 {
+        match read() {
+            Err(crate::clipboard_reader::ReadFailure::Failed(_)) if attempt + 1 < 10 => {
+                pause(clipboard_retry_delay(attempt))
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 #[cfg(target_os = "windows")]
@@ -3942,6 +3958,44 @@ pub use capture_probe::run_capture_probe;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn temporary_privacy_read_contention_recovers_without_exhausting_rdp_sampling() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let observed = super::retry_sensitive_markers(
+            || {
+                if elapsed.get() < Duration::from_millis(200) {
+                    Err(crate::clipboard_reader::ReadFailure::Failed(
+                        "transient contention".into(),
+                    ))
+                } else {
+                    Ok(super::SensitiveMarkers {
+                        history_exclusion: true,
+                        cloud_exclusion: true,
+                        ..Default::default()
+                    })
+                }
+            },
+            |delay| elapsed.set(elapsed.get() + delay),
+        )
+        .unwrap();
+        assert!(observed.history_exclusion && observed.cloud_exclusion);
+        assert!(elapsed.get() >= Duration::from_millis(200));
+        let mut attempts = 0;
+        let hung = super::retry_sensitive_markers(
+            || {
+                attempts += 1;
+                Err(crate::clipboard_reader::ReadFailure::Unresponsive)
+            },
+            |_| panic!("a hung owner must not be retried"),
+        );
+        assert!(matches!(
+            hung,
+            Err(crate::clipboard_reader::ReadFailure::Unresponsive)
+        ));
+        assert_eq!(attempts, 1);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn unreadable_privacy_dwords_are_errors_rather_than_permission_to_retain_or_relay() {
