@@ -101,7 +101,7 @@ mRemoteNG and unelevated Cubby. The first 50-copy run preceded that UAC change.
 | Cubby stopped: sequence-triggered Windows observer | 15/100; final local paste returned the 100th value |
 | Cubby stopped: continuous Windows observer | 100/100 distinct values at requested 100 ms |
 | Candidate with RDP text sampling, requested 100 ms | 100/100 exact stored payloads |
-| Final candidate: repeat requested 100 ms run | 100/100; all 300 text fixtures retained across the completed batches |
+| Earlier sampling candidate: repeat requested 100 ms run | 100/100; all 300 text fixtures retained across the completed batches |
 | Windows restart, Cubby restart, and RDP reconnect | First 50 retained; next 50 accepted |
 | Unicode and multiline remote copy | Exact stored UTF-8 payload |
 | Remote RTF | Exact stored RTF and plain text |
@@ -135,6 +135,44 @@ The reader timeout tests remain serialized around their shared worker.
 The coherence rechecks reduce race windows; they cannot reconstruct content
 that was overwritten before a read or prove atomic generations when the RDP
 transport supplies neither a sequence change nor an immutable data object.
+
+## Fresh reviewed-source validation
+
+The reviewed source passed Windows CI, including tests, Clippy, release checks,
+and the x64/ARM64 default and app-store compile matrix. Fresh isolated Windows
+runs on source `0fc4cc1` retained 100/100 unique remote copies at the requested
+100 ms interval, one first remote copy after restarting Cubby, 50/50 exact text
+and RTF payload pairs, and a 1.08 MB text/RTF payload. Source `3a1b9dc` then
+retained all six same-text copies with distinct RTF formatting and the same
+large text/RTF payload. Its only functional difference is streaming the existing
+fingerprint digest without building a combined payload buffer; compatibility
+with the original digest is independently tested.
+
+Sampling continues while an RDP owner holds text. In this four-vCPU VM, an
+unchanged small text/RTF copy used about 4.7% of one CPU core over eight seconds.
+An unchanged 1.08 MB text/RTF copy used 20.1% on `0fc4cc1` and 19.1% on `3a1b9dc`,
+with approximately 45 MB working set in the latter run. These short samples do
+not establish a significant performance improvement. Idle backoff or skipping
+rich formats was not applied because those changes can lose copies after idle
+or changes that affect only formatting. Persistent polling cost remains a
+performance limitation.
+
+## Signed installer upgrade smoke
+
+The signed private candidate from `0fc4cc1` upgraded the existing x64 v1.3.5
+installation to v1.3.6. The slim installer and offline Store-channel installer
+both installed successfully. Exactly `cubby.exe` and `uninstall.exe` were
+installed, with valid Authenticode signatures. This is NSIS channel-package
+validation, not an update performed by the Microsoft Store client.
+
+All 36 seeded pre-upgrade history records retained their UUID, content hash,
+encrypted content, and active status, and the protected storage key was
+unchanged. The packaged build captured a fresh remote username/password pair;
+the password pasted locally and the earlier username pasted exactly from Cubby
+into an empty local Windows rich text box. A forwarded Clipboard Viewer Ignore
+fixture was excluded and the following ordinary copy was retained. Compact
+view persisted across cold restart, Win+V opened the installed flyout, and
+autostart added and removed its installed-path Run entry correctly.
 
 ## Remaining acceptance
 

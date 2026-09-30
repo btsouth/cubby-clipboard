@@ -7,8 +7,8 @@ All notable Cubby Clipboard changes are documented here. PastePaw entries below 
 ## v1.3.6
 
 ### Fixed
-- Ordinary text copied through mRemoteNG now appears in history even when Windows RDP adds blanket history/cloud exclusion flags. Explicit content exclusions and Ignored Apps still apply; remote copies can still be saved with Skip sensitive enabled.
-- Capture samples changing RDP text when Windows does not send another clipboard notification. Sampling survives listener restarts, rejects changing text/format or privacy reads, and stops retrying an unresponsive owner after its bounded budget.
+- Ordinary text copied through mRemoteNG now appears in history even when Windows RDP adds blanket history/cloud exclusion flags. Clipboard Viewer Ignore and Ignored Apps remain enforced; remote copies, including passwords, can still be saved with Skip sensitive enabled.
+- Capture samples changing RDP text when Windows does not send another clipboard notification. Sampling survives listener restarts, rechecks text, ownership, and privacy markers around rich-format reads, and stops retrying an unresponsive owner after its bounded budget.
 - Queued captures retain their source identity if the copying application exits before storage. Unreadable privacy flags no longer permit capture or strip flags through relay.
 - mRemoteNG uses the remote-session paste timing shared with Windows RDP clients.
 
