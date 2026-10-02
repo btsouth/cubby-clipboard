@@ -204,4 +204,4 @@ When using Brandon's infrastructure, use the assigned devbox task worktree for h
 
 Remove only this task's clean, landed worktree with `git worktree remove`. If an empty directory remains on Windows, confirm it is empty before deleting it. Do not force-delete a worktree with ongoing work.
 
-This repo squash-merges PRs, so branch ancestry does not prove whether work landed. Use the account wrapper with `pr list --state merged --head <branch> --json number,headRefName,title`; filter by the exact head instead of paging through unrelated merged PRs.
+This repo squash-merges PRs, so branch ancestry does not prove whether work landed. Use the account wrapper with `pr list --state merged --head <branch> --json number,headRefName,headRefOid,title`. Compare the returned `headRefOid` with the worktree tip from `git rev-parse HEAD` before removing it; a branch-name match alone does not prove later commits landed.
