@@ -122,7 +122,7 @@ pnpm run test
 
 ## Known Gotchas
 
-- **Removing a variable used in JSX** — TypeScript won't always catch `ReferenceError` at compile time if the variable is used inside a JSX expression that the TS compiler doesn't fully evaluate. Always `grep` for the variable name across all `.tsx` files before deleting it.
+- **Removing a variable used in JSX** — TypeScript won't always catch `ReferenceError` at compile time if the variable is used inside a JSX expression that the TS compiler doesn't fully evaluate. Check relevant references when removing a variable and run the affected frontend checks.
 - **Two hotkey registration sites** — initial setup in `lib.rs::setup()` and re-registration in `commands::register_global_shortcut`. Both must have identical show/hide toggle logic.
 - **WiX MSI arm64** — both x64 and arm64 WiX MSIs are detected as x64 by komac. Use NSIS `*-setup.exe` for winget.
 - **`IS_ANIMATING` deadlock** — if a thread panics between setting `IS_ANIMATING = true` and resetting it to `false`, the window becomes permanently stuck. Always ensure the reset happens in all code paths.
@@ -200,28 +200,8 @@ Chinese entries inherited from the fork remain for attribution, but do not add
 translations unless Cubby explicitly ships and supports that locale.
 
 ### Worktrees
-Create task worktrees under `../.worktrees/<task-name>`, never beside the repo in the projects root. Sibling worktrees (`cubby-clipboard-<task>`) bury the real projects in a long directory listing.
+When using Brandon's infrastructure, use the assigned devbox task worktree for heavy work; contributors can use their own environment. Windows-specific checks require a Windows environment; on Brandon's infrastructure, discover the existing route first; do not assume this checkout runs in PowerShell. Reuse the same worktree and cache through fixes.
 
-```bash
-git worktree add ../.worktrees/sou-123-fix -b codex/sou-123-fix
-```
+Remove only this task's clean, landed worktree with `git worktree remove`. If an empty directory remains on Windows, confirm it is empty before deleting it. Do not force-delete a worktree with ongoing work.
 
-When the work has landed, remove the worktree and prune, then delete the directory:
-
-```powershell
-git worktree remove ../.worktrees/sou-123-fix
-git worktree prune
-Remove-Item -Recurse -Force ../.worktrees/sou-123-fix
-```
-
-The last line is PowerShell, the default shell here. In Git Bash or WSL use `rm -rf ../.worktrees/sou-123-fix` instead.
-
-On Windows `git worktree remove` deletes the files but leaves the empty directory tree in place, so that explicit delete is required. Skipping it is what accumulates empty skeleton directories.
-
-This repo squash-merges every PR, so a branch's commits never become ancestors of `main`. Do not use `git merge-base --is-ancestor` or `git log main..branch` to decide whether work has landed — both report merged work as unmerged. Check the branch's merged PR instead:
-
-```bash
-gh pr list --state merged --head <branch> --json number,headRefName,title
-```
-
-Filter by `--head`. Listing merged PRs and scanning the results can page past the one you care about and report a merged branch as unmerged, which is the mistake this note exists to prevent.
+This repo squash-merges PRs, so branch ancestry does not prove whether work landed. Use the account wrapper with `pr list --state merged --head <branch> --json number,headRefName,title`; filter by the exact head instead of paging through unrelated merged PRs.
