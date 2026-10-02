@@ -21,6 +21,7 @@ env:
 
 jobs:
   test:
+    timeout-minutes: 30
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -42,14 +43,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-
+          workspaces: src-tauri
+          key: ci-tests
+          cache-bin: "false"
       - run: pnpm install --frozen-lockfile
       - run: pnpm run format:check
       - run: pnpm run lint
@@ -148,17 +146,11 @@ jobs:
 
       # Per-target, per-feature cache so the four legs and the `test` job
       # cannot clobber each other's src-tauri/target.
-      - uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-check-${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-check-${{ matrix.target }}-${{ matrix.features }}-
-            ${{ runner.os }}-cargo-check-${{ matrix.target }}-
-
+          workspaces: src-tauri
+          key: ci-check-${{ matrix.target }}-${{ matrix.features }}
+          cache-bin: "false"
       # tauri::generate_context! requires frontendDist ("../dist") to exist.
       # The test job creates it via pnpm build; this matrix only cargo-checks.
       - run: mkdir dist
