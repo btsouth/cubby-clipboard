@@ -586,6 +586,9 @@ jobs:
 
   submit-store:
     name: Submit Microsoft Store update
+    concurrency:
+      group: microsoft-store-submission
+      cancel-in-progress: false
     if: github.event_name != 'workflow_dispatch'
     # SBS-1068: this job runs `msstore submission publish` into Partner Center.
     # Gate on validate the same way publish-release gates GitHub undraft. A red
@@ -682,8 +685,10 @@ jobs:
   publish-release:
     name: Publish validated release
     if: github.event_name != 'workflow_dispatch'
-    # Gate publishing on validate too, since create-release/build no longer do.
-    needs: [validate, create-release, build-installers, updater-manifest, submit-store]
+    # Publish only validated, signed builds with a complete updater manifest.
+    # Partner Center is an independent distribution channel: a submission
+    # outage must not keep these verified GitHub assets in draft.
+    needs: [validate, create-release, build-installers, updater-manifest]
     runs-on: ubuntu-latest
     # A single release edit.
     timeout-minutes: 15

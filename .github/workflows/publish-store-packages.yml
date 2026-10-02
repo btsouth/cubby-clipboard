@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   publish:
+    timeout-minutes: 10
     name: Publish signed installers
     runs-on: windows-latest
     environment: release
