@@ -48,6 +48,7 @@ jobs:
           workspaces: src-tauri
           key: ci-tests
           cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: pnpm install --frozen-lockfile
       - run: pnpm run format:check
       - run: pnpm run lint
@@ -150,6 +151,7 @@ jobs:
         with:
           workspaces: src-tauri
           key: ci-check-${{ matrix.target }}-${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: "false"
       # tauri::generate_context! requires frontendDist ("../dist") to exist.
       # The test job creates it via pnpm build; this matrix only cargo-checks.
