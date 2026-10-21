@@ -42,7 +42,10 @@ tauri-plugin-autostart = "2"
 tauri-plugin-log = "2.8.0"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2"
+# Default features add zip extraction, which only v1-compatible .zip updates
+# need. Cubby ships plain signed setup.exe updates (createUpdaterArtifacts:
+# true), so leave zip, tar and flate2 out.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 tauri-plugin-process = "2"
 log = "0.4.29"
 window-vibrancy = { git = "https://github.com/XueshiQiao/window-vibrancy.git" }
