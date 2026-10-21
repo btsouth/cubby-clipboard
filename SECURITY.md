@@ -16,8 +16,8 @@ The opener URL allowlist in `src-tauri/capabilities/default.json` is checked by 
 
 `scripts/audit-rust.ps1` permits this one lockfile-only advisory and fails if RSA becomes reachable on any target. The waiver must be removed if SQLx stops recording the inactive package or if Cubby enables another SQLx database driver.
 
-- Reviewed: 2026-07-19
-- Next review: 2026-10-19 (or immediately if SQLx or the lockfile graph changes)
+- Reviewed: 2026-10-21
+- Next review: 2027-01-21 (or immediately if SQLx or the lockfile graph changes)
 
 
 ## Win+V helper channel
