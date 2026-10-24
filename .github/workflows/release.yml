@@ -40,13 +40,13 @@ jobs:
 
       # Cache the cargo registry + src-tauri/target across runs so the cargo test
       # and clippy compiles below are incremental instead of cold every run.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
 
       # Install a prebuilt cargo-audit binary instead of compiling it from source
       # (cargo install cargo-audit) on every run.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-audit
 
@@ -221,7 +221,7 @@ jobs:
 
       # Per-target cargo cache (keyed by matrix.target so x64 and arm64 don't
       # clobber each other) to keep the installer compiles incremental.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
           key: ${{ matrix.target }}
