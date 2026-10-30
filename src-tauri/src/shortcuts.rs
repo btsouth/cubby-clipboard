@@ -44,6 +44,23 @@ pub fn get_hotkey_startup_notice() -> Option<HotkeyStartupNotice> {
     STARTUP_NOTICE.lock().unwrap().take()
 }
 
+/// The shortcut registered this session, which can differ from the saved
+/// settings after startup recovery (fallback hotkey, Win+V disabled).
+#[derive(Clone, serde::Serialize)]
+pub struct ActiveShortcut {
+    pub hotkey: Option<String>,
+    pub replace_win_v: bool,
+}
+
+#[tauri::command]
+pub fn get_active_shortcut() -> ActiveShortcut {
+    let current = CURRENT_CONFIGURATION.lock().unwrap().clone();
+    ActiveShortcut {
+        hotkey: current.hotkey,
+        replace_win_v: current.replace_win_v,
+    }
+}
+
 fn parser_hotkey(hotkey: &str) -> String {
     hotkey
         .split('+')
@@ -114,6 +131,12 @@ pub fn register_shortcuts(
                 "SHORTCUT: Failed to restore previous configuration after conflict: {}",
                 restore_error
             );
+            // Nothing is registered now. Forget the cached configuration so a
+            // later request for it registers again instead of returning early,
+            // and bring back the tray icon as the way into Cubby.
+            *CURRENT_CONFIGURATION.lock().unwrap() = ShortcutConfiguration::default();
+            crate::set_shortcut_ready(false);
+            crate::apply_tray_visibility(app);
         } else {
             *CURRENT_CONFIGURATION.lock().unwrap() = previous;
         }
@@ -128,6 +151,7 @@ pub fn register_shortcuts(
     }
 
     *CURRENT_CONFIGURATION.lock().unwrap() = requested;
+    crate::set_shortcut_ready(true);
     if replace_win_v {
         log::info!(
             "SHORTCUT: Registered {} with Win+V replacement bridge {}",

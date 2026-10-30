@@ -4,6 +4,10 @@ All notable Cubby Clipboard changes are documented here. PastePaw entries below 
 
 ## Unreleased
 
+### Added
+- Settings > General can hide the tray icon. Cubby keeps running and opens with your shortcut or by launching it again from the Start menu. The icon still shows for a session where no shortcut could be registered. (#368)
+- Quit Cubby from Settings > General, so quitting no longer depends on the tray menu.
+
 ## v1.3.7
 
 ### Fixed

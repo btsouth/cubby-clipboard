@@ -1,9 +1,11 @@
-import type { Settings } from '../../types';
+import type { ActiveShortcut, Settings } from '../../types';
 import { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useShortcutRecorder } from 'use-shortcut-recorder';
 import { clsx } from 'clsx';
 import { PaneHeader, Row, SectionLabel, Segmented, SettingCard, Toggle, ghostButton } from './ui';
 import type { UpdateSetting } from './types';
+import { ConfirmDialog } from '../ConfirmDialog';
 
 interface GeneralTabProps {
   settings: Settings;
@@ -12,6 +14,9 @@ interface GeneralTabProps {
 
 export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
   const [isRecordingMode, setIsRecordingMode] = useState(false);
+  // Message for the hide-tray confirmation; null while it is closed.
+  const [hideTrayMessage, setHideTrayMessage] = useState<string | null>(null);
+  const showTrayIcon = settings.show_tray_icon ?? true;
   const handleThemeChange = (newTheme: string) => {
     updateSetting('theme', newTheme);
   };
@@ -62,6 +67,34 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
     setIsRecordingMode(false);
   };
 
+  // Hiding the icon removes the visible way back in, so say how to return first.
+  // Name the shortcut that is registered right now, not the saved one: startup
+  // can fall back to another hotkey or turn Win+V off for the session.
+  const handleTrayIconToggle = async () => {
+    if (!showTrayIcon) {
+      updateSetting('show_tray_icon', true);
+      return;
+    }
+    let active: ActiveShortcut | null = null;
+    try {
+      active = await invoke<ActiveShortcut | null>('get_active_shortcut');
+    } catch (error) {
+      console.error('Failed to read the active shortcut:', error);
+    }
+    const keys = active?.hotkey
+      ? `${active.hotkey}${active.replace_win_v ? ' or Win+V' : ''}`
+      : null;
+    setHideTrayMessage(
+      keys
+        ? `Cubby keeps running and saving your clipboard history. Open it with ${keys}, or by launching Cubby again from the Start menu. Quit is in Settings > General.`
+        : 'Cubby has no working shortcut right now, so the icon stays visible until one is set. After that, open Cubby with your shortcut or by launching it again from the Start menu.'
+    );
+  };
+
+  const handleQuit = () => {
+    invoke('quit_app').catch((error) => console.error('Failed to quit Cubby:', error));
+  };
+
   const windowEffectValue =
     settings.mica_effect === 'clear'
       ? 'solid'
@@ -71,6 +104,18 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
 
   return (
     <div className="space-y-7">
+      <ConfirmDialog
+        isOpen={hideTrayMessage !== null}
+        title={'Hide the tray icon?'}
+        message={hideTrayMessage ?? ''}
+        confirmText={'Hide icon'}
+        variant={'info'}
+        onConfirm={() => {
+          setHideTrayMessage(null);
+          updateSetting('show_tray_icon', false);
+        }}
+        onCancel={() => setHideTrayMessage(null)}
+      />
       <PaneHeader title={'General'} subtitle={'How Cubby looks and behaves on this PC.'} />
 
       <section>
@@ -173,6 +218,28 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
               />
             }
           />
+          <Row
+            title={'Show tray icon'}
+            desc={
+              'Keep the Cubby icon in the notification area. When hidden, open Cubby with your shortcut or by launching it again. The icon comes back on its own if no shortcut is available.'
+            }
+            control={
+              <Toggle
+                checked={showTrayIcon}
+                onChange={handleTrayIconToggle}
+                label={'Show tray icon'}
+              />
+            }
+          />
+          <Row
+            title={'Quit Cubby'}
+            desc={'Stop Cubby and clipboard history until you start it again.'}
+            control={
+              <button onClick={handleQuit} className={ghostButton}>
+                {'Quit'}
+              </button>
+            }
+          />
         </SettingCard>
       </section>
 
@@ -272,7 +339,7 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
             {settings.replace_win_v && (
               <p className="mt-3 text-xs text-muted-foreground">
                 {
-                  "Replace Windows clipboard shortcut also lets your hotkey open Cubby inside remote sessions when the remote client's keyboard forwarding is off. With forwarding on, open Cubby from the tray icon."
+                  "Replace Windows clipboard shortcut also lets your hotkey open Cubby inside remote sessions when the remote client's keyboard forwarding is off. With forwarding on, open Cubby from the tray icon, or from the Start menu if the icon is hidden."
                 }
               </p>
             )}

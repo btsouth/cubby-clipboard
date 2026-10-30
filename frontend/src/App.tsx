@@ -142,6 +142,7 @@ function App() {
         mica_effect: 'clear',
         round_corners: true,
         float_above_taskbar: true,
+        show_tray_icon: true,
         density: 'comfortable',
         remote_paste_mode: 'copy_then_paste',
         remote_clipboard_relay: true,

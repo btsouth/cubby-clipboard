@@ -25,6 +25,10 @@ pub struct AppSettings {
     pub startup_with_windows: bool,
     pub round_corners: bool,
     pub float_above_taskbar: bool,
+    // Show the notification-area icon. When off, Cubby is reached only through
+    // its shortcut or by launching it again; the icon still shows for a session
+    // that has no working global shortcut (see tray_icon_should_show).
+    pub show_tray_icon: bool,
     pub density: String,
 
     // First-run onboarding: false until the user dismisses the welcome overlay.
@@ -70,6 +74,7 @@ impl Default for AppSettings {
             startup_with_windows: false,
             round_corners: true,
             float_above_taskbar: true,
+            show_tray_icon: true,
             density: "comfortable".to_string(),
 
             has_completed_onboarding: false,

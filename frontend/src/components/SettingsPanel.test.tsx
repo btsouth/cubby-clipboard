@@ -42,6 +42,7 @@ const baseSettings: Settings = {
 let folders: FolderItem[];
 let saves: { settings: Settings; changedKeys: string[] }[];
 let releaseFirstSave: (() => void) | null;
+let activeShortcut: { hotkey: string | null; replace_win_v: boolean } | null;
 
 function folder(id: string, name: string, itemCount: number, isSystem = false): FolderItem {
   return { id, name, icon: null, color: null, is_system: isSystem, item_count: itemCount };
@@ -51,6 +52,7 @@ beforeEach(() => {
   folders = [folder('sys', 'Pinned', 4, true), folder('f1', 'Work', 3)];
   saves = [];
   releaseFirstSave = null;
+  activeShortcut = { hotkey: 'Ctrl+Shift+V', replace_win_v: false };
   vi.mocked(invoke).mockImplementation(async (command: string, args?: unknown) => {
     const payload = args as Record<string, unknown> | undefined;
     switch (command) {
@@ -67,6 +69,8 @@ beforeEach(() => {
           unavailable: 0,
           paused: false,
         };
+      case 'get_active_shortcut':
+        return activeShortcut;
       case 'get_storage_usage':
         return { items: 0, bytes: 0 };
       case 'create_folder':
@@ -142,6 +146,60 @@ describe('SettingsPanel shell', () => {
       'settings-changed',
       expect.objectContaining({ round_corners: true, float_above_taskbar: false })
     );
+  });
+});
+
+describe('SettingsPanel tray icon', () => {
+  it('asks before hiding the tray icon and saves only on confirm', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Hide the tray icon?' });
+    expect(dialog).toHaveTextContent('Ctrl+Shift+V');
+    expect(saves).toHaveLength(0);
+
+    fireEvent.click(within(dialog).getByText('Cancel'));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(saves).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Hide icon' }));
+    await waitFor(() => expect(saves).toHaveLength(1));
+    expect(saves[0].changedKeys).toEqual(['show_tray_icon']);
+    expect(saves[0].settings.show_tray_icon).toBe(false);
+  });
+
+  it('names the shortcut active this session, not the saved one', async () => {
+    activeShortcut = { hotkey: 'Win+Ctrl+Alt+V', replace_win_v: false };
+    renderPanel({ hotkey: 'Win+Alt+V', replace_win_v: true });
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Hide the tray icon?' });
+    expect(dialog).toHaveTextContent('Open it with Win+Ctrl+Alt+V, or by launching');
+    expect(dialog).not.toHaveTextContent('Win+V');
+  });
+
+  it('says the icon stays while no shortcut is registered', async () => {
+    activeShortcut = { hotkey: null, replace_win_v: false };
+    renderPanel();
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Hide the tray icon?' });
+    expect(dialog).toHaveTextContent('no working shortcut right now');
+  });
+
+  it('shows the tray icon again without asking', async () => {
+    renderPanel({ show_tray_icon: false });
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(saves).toHaveLength(1));
+    expect(saves[0].settings.show_tray_icon).toBe(true);
+  });
+
+  it('quits from Settings', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Quit' }));
+    expect(invoke).toHaveBeenCalledWith('quit_app');
   });
 });
 
