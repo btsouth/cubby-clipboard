@@ -4,9 +4,20 @@ All notable Cubby Clipboard changes are documented here. PastePaw entries below 
 
 ## Unreleased
 
+## v1.3.8
+
 ### Added
 - Settings > General can hide the tray icon. Cubby keeps running and opens with your shortcut or by launching it again from the Start menu. The icon still shows for a session where no shortcut could be registered. (#368)
 - Quit Cubby from Settings > General, so quitting no longer depends on the tray menu.
+
+### Security
+- Updated dependencies to resolve advisories in rustls, rustls-webpki, ctutils, source-map-js and brace-expansion. The updater no longer pulls in the zip crate, which removes its open advisories.
+
+### Changed
+- Release publishing on GitHub no longer waits on the Microsoft Store submission, so a slow Partner Center review cannot hold back a validated release.
+
+### Thanks
+- Thanks to [Luiz Bizzio](https://github.com/luizbizzio) for requesting the hidden tray icon option (#368)
 
 ## v1.3.7
 
