@@ -1,4 +1,4 @@
-import type { Settings } from '../../types';
+import type { ActiveShortcut, Settings } from '../../types';
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useShortcutRecorder } from 'use-shortcut-recorder';
@@ -14,7 +14,8 @@ interface GeneralTabProps {
 
 export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
   const [isRecordingMode, setIsRecordingMode] = useState(false);
-  const [confirmHideTray, setConfirmHideTray] = useState(false);
+  // Message for the hide-tray confirmation; null while it is closed.
+  const [hideTrayMessage, setHideTrayMessage] = useState<string | null>(null);
   const showTrayIcon = settings.show_tray_icon ?? true;
   const handleThemeChange = (newTheme: string) => {
     updateSetting('theme', newTheme);
@@ -67,12 +68,27 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
   };
 
   // Hiding the icon removes the visible way back in, so say how to return first.
-  const handleTrayIconToggle = () => {
-    if (showTrayIcon) {
-      setConfirmHideTray(true);
-    } else {
+  // Name the shortcut that is registered right now, not the saved one: startup
+  // can fall back to another hotkey or turn Win+V off for the session.
+  const handleTrayIconToggle = async () => {
+    if (!showTrayIcon) {
       updateSetting('show_tray_icon', true);
+      return;
     }
+    let active: ActiveShortcut | null = null;
+    try {
+      active = await invoke<ActiveShortcut | null>('get_active_shortcut');
+    } catch (error) {
+      console.error('Failed to read the active shortcut:', error);
+    }
+    const keys = active?.hotkey
+      ? `${active.hotkey}${active.replace_win_v ? ' or Win+V' : ''}`
+      : null;
+    setHideTrayMessage(
+      keys
+        ? `Cubby keeps running and saving your clipboard history. Open it with ${keys}, or by launching Cubby again from the Start menu. Quit is in Settings > General.`
+        : 'Cubby has no working shortcut right now, so the icon stays visible until one is set. After that, open Cubby with your shortcut or by launching it again from the Start menu.'
+    );
   };
 
   const handleQuit = () => {
@@ -89,16 +105,16 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
   return (
     <div className="space-y-7">
       <ConfirmDialog
-        isOpen={confirmHideTray}
+        isOpen={hideTrayMessage !== null}
         title={'Hide the tray icon?'}
-        message={`Cubby keeps running and saving your clipboard history. Open it with ${settings.hotkey}${settings.replace_win_v ? ' or Win+V' : ''}, or by launching Cubby again from the Start menu. Quit is in Settings > General.`}
+        message={hideTrayMessage ?? ''}
         confirmText={'Hide icon'}
         variant={'info'}
         onConfirm={() => {
-          setConfirmHideTray(false);
+          setHideTrayMessage(null);
           updateSetting('show_tray_icon', false);
         }}
-        onCancel={() => setConfirmHideTray(false)}
+        onCancel={() => setHideTrayMessage(null)}
       />
       <PaneHeader title={'General'} subtitle={'How Cubby looks and behaves on this PC.'} />
 

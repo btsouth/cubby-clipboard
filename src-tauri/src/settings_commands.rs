@@ -168,11 +168,8 @@ pub async fn save_settings(
         return Err(error);
     }
 
-    // A shortcut save only reaches here after registration succeeded, so a
-    // session that started without one now has a way in again.
-    if shortcut_settings_changed {
-        crate::set_shortcut_ready(true);
-    }
+    // register_shortcuts tracks whether a shortcut is live; re-check the tray
+    // icon against it whenever the shortcut or the setting changed.
     if shortcut_settings_changed || new_settings.show_tray_icon != current.show_tray_icon {
         crate::apply_tray_visibility(&app);
     }

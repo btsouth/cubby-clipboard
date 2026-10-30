@@ -54,6 +54,12 @@ export interface FolderItem {
   item_count: number;
 }
 
+// The shortcut registered this session (get_active_shortcut).
+export interface ActiveShortcut {
+  hotkey: string | null;
+  replace_win_v: boolean;
+}
+
 export interface Settings {
   max_items: number;
   auto_delete_days: number;
