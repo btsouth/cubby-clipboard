@@ -154,7 +154,7 @@ describe('SettingsPanel tray icon', () => {
     expect(dialog).toHaveTextContent('Ctrl+Shift+V');
     expect(saves).toHaveLength(0);
 
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(dialog).getByText('Cancel'));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(saves).toHaveLength(0);
 
