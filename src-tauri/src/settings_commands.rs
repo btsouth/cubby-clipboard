@@ -168,6 +168,15 @@ pub async fn save_settings(
         return Err(error);
     }
 
+    // A shortcut save only reaches here after registration succeeded, so a
+    // session that started without one now has a way in again.
+    if shortcut_settings_changed {
+        crate::set_shortcut_ready(true);
+    }
+    if shortcut_settings_changed || new_settings.show_tray_icon != current.show_tray_icon {
+        crate::apply_tray_visibility(&app);
+    }
+
     // Window effect
     let theme_str = new_settings.theme.clone();
     let mica_effect = new_settings.mica_effect.clone();
@@ -235,6 +244,14 @@ fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
             if enabled { "enable" } else { "disable" }
         )
     })
+}
+
+/// Quit from Settings. Same exit as the tray menu's Quit, which is out of reach
+/// when the tray icon is hidden.
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    log::info!("SETTINGS: Quit requested");
+    app.exit(0);
 }
 
 #[tauri::command]

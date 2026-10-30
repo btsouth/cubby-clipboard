@@ -13,6 +13,9 @@ use tauri_plugin_autostart::MacosLauncher;
 static LAST_SHOW_TIME: AtomicI64 = AtomicI64::new(0);
 static SHOW_GENERATION: AtomicU64 = AtomicU64::new(0);
 static FLYOUT_WORKER_LIVE: AtomicBool = AtomicBool::new(false);
+// Whether a global shortcut is registered this session. Without one the tray
+// icon is the only way into Cubby, so it is shown even when the user hid it.
+static SHORTCUT_READY: AtomicBool = AtomicBool::new(false);
 
 mod backup;
 mod backup_import_optional;
@@ -374,7 +377,7 @@ pub fn run_app() {
                 .icon(icon)
                 .menu(&menu);
 
-            let _tray = tray_builder
+            let tray = tray_builder
                 .tooltip("Cubby")
                 .on_menu_event(move |app, event| {
                     if event.id.as_ref() == "quit" {
@@ -397,6 +400,14 @@ pub fn run_app() {
                     }
                 })
                 .build(app)?;
+            // Hide before the shortcut outcome is known so a hidden icon does not
+            // flash at login; apply_tray_visibility below brings it back if no
+            // shortcut registers.
+            if !handle.state::<Arc<SettingsManager>>().get().show_tray_icon {
+                if let Err(error) = tray.set_visible(false) {
+                    log::warn!("TRAY: Could not hide the tray icon: {}", error);
+                }
+            }
 
             let app_handle = handle.clone();
             let win = app_handle.get_webview_window("main").unwrap();
@@ -511,6 +522,8 @@ pub fn run_app() {
                 log::error!("SHORTCUT: Cubby started without a working global shortcut");
                 shortcuts::record_startup_notice("failed", &user_hotkey, None);
             }
+            SHORTCUT_READY.store(shortcuts_ready, Ordering::SeqCst);
+            apply_tray_visibility(&app_handle);
             let handle_for_clip = app_handle.clone();
             let db_for_clip = db_for_clipboard.clone();
             clipboard::init(&handle_for_clip, db_for_clip);
@@ -584,6 +597,7 @@ pub fn run_app() {
             settings_commands::get_settings,
             settings_commands::save_settings,
             settings_commands::complete_onboarding,
+            settings_commands::quit_app,
             commands::get_clipboard_history_size,
             commands::get_storage_usage,
             commands::reclaim_storage,
@@ -1418,6 +1432,38 @@ pub fn apply_window_effect(
     suppress_native_window_frame(window);
 }
 
+/// The tray icon is the fallback way into Cubby, so it stays visible while no
+/// global shortcut is registered, whatever the setting says.
+fn tray_icon_should_show(show_tray_icon: bool, shortcut_ready: bool) -> bool {
+    show_tray_icon || !shortcut_ready
+}
+
+pub(crate) fn set_shortcut_ready(ready: bool) {
+    SHORTCUT_READY.store(ready, Ordering::SeqCst);
+}
+
+/// Show or hide the tray icon from the current setting. Windows removes a
+/// hidden icon from the notification area entirely (not just the overflow), and
+/// tray-icon keeps it hidden when Explorer restarts.
+pub(crate) fn apply_tray_visibility(app: &tauri::AppHandle) {
+    let show_tray_icon = app.state::<Arc<SettingsManager>>().get().show_tray_icon;
+    let shortcut_ready = SHORTCUT_READY.load(Ordering::SeqCst);
+    let visible = tray_icon_should_show(show_tray_icon, shortcut_ready);
+    if !visible || show_tray_icon {
+        log::info!("TRAY: visible={}", visible);
+    } else {
+        log::warn!("TRAY: Showing the tray icon because no global shortcut is registered");
+    }
+    match app.tray_by_id("main") {
+        Some(tray) => {
+            if let Err(error) = tray.set_visible(visible) {
+                log::warn!("TRAY: Could not change tray icon visibility: {}", error);
+            }
+        }
+        None => log::warn!("TRAY: Tray icon not found"),
+    }
+}
+
 pub fn update_tray_icon(tray: &TrayIcon, theme: &tauri::Theme) {
     let icon_data: &[u8] = match theme {
         tauri::Theme::Dark => include_bytes!("../icons/tray_white.png"),
@@ -1425,6 +1471,23 @@ pub fn update_tray_icon(tray: &TrayIcon, theme: &tauri::Theme) {
     };
     if let Ok(icon) = Image::from_bytes(icon_data) {
         let _ = tray.set_icon(Some(icon));
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::tray_icon_should_show;
+
+    #[test]
+    fn follows_the_setting_when_a_shortcut_is_registered() {
+        assert!(tray_icon_should_show(true, true));
+        assert!(!tray_icon_should_show(false, true));
+    }
+
+    #[test]
+    fn stays_visible_without_a_working_shortcut() {
+        assert!(tray_icon_should_show(true, false));
+        assert!(tray_icon_should_show(false, false));
     }
 }
 

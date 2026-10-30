@@ -145,6 +145,41 @@ describe('SettingsPanel shell', () => {
   });
 });
 
+describe('SettingsPanel tray icon', () => {
+  it('asks before hiding the tray icon and saves only on confirm', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'Hide the tray icon?' });
+    expect(dialog).toHaveTextContent('Ctrl+Shift+V');
+    expect(saves).toHaveLength(0);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(saves).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Hide icon' }));
+    await waitFor(() => expect(saves).toHaveLength(1));
+    expect(saves[0].changedKeys).toEqual(['show_tray_icon']);
+    expect(saves[0].settings.show_tray_icon).toBe(false);
+  });
+
+  it('shows the tray icon again without asking', async () => {
+    renderPanel({ show_tray_icon: false });
+    fireEvent.click(screen.getByRole('switch', { name: 'Show tray icon' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(saves).toHaveLength(1));
+    expect(saves[0].settings.show_tray_icon).toBe(true);
+  });
+
+  it('quits from Settings', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Quit' }));
+    expect(invoke).toHaveBeenCalledWith('quit_app');
+  });
+});
+
 describe('SettingsPanel Folders tab', () => {
   it('lists only custom folders with their item counts', async () => {
     renderPanel();

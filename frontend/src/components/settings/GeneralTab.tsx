@@ -1,9 +1,11 @@
 import type { Settings } from '../../types';
 import { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useShortcutRecorder } from 'use-shortcut-recorder';
 import { clsx } from 'clsx';
 import { PaneHeader, Row, SectionLabel, Segmented, SettingCard, Toggle, ghostButton } from './ui';
 import type { UpdateSetting } from './types';
+import { ConfirmDialog } from '../ConfirmDialog';
 
 interface GeneralTabProps {
   settings: Settings;
@@ -12,6 +14,8 @@ interface GeneralTabProps {
 
 export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
   const [isRecordingMode, setIsRecordingMode] = useState(false);
+  const [confirmHideTray, setConfirmHideTray] = useState(false);
+  const showTrayIcon = settings.show_tray_icon ?? true;
   const handleThemeChange = (newTheme: string) => {
     updateSetting('theme', newTheme);
   };
@@ -62,6 +66,19 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
     setIsRecordingMode(false);
   };
 
+  // Hiding the icon removes the visible way back in, so say how to return first.
+  const handleTrayIconToggle = () => {
+    if (showTrayIcon) {
+      setConfirmHideTray(true);
+    } else {
+      updateSetting('show_tray_icon', true);
+    }
+  };
+
+  const handleQuit = () => {
+    invoke('quit_app').catch((error) => console.error('Failed to quit Cubby:', error));
+  };
+
   const windowEffectValue =
     settings.mica_effect === 'clear'
       ? 'solid'
@@ -71,6 +88,18 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
 
   return (
     <div className="space-y-7">
+      <ConfirmDialog
+        isOpen={confirmHideTray}
+        title={'Hide the tray icon?'}
+        message={`Cubby keeps running and saving your clipboard history. Open it with ${settings.hotkey}${settings.replace_win_v ? ' or Win+V' : ''}, or by launching Cubby again from the Start menu. Quit is in Settings > General.`}
+        confirmText={'Hide icon'}
+        variant={'info'}
+        onConfirm={() => {
+          setConfirmHideTray(false);
+          updateSetting('show_tray_icon', false);
+        }}
+        onCancel={() => setConfirmHideTray(false)}
+      />
       <PaneHeader title={'General'} subtitle={'How Cubby looks and behaves on this PC.'} />
 
       <section>
@@ -173,6 +202,28 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
               />
             }
           />
+          <Row
+            title={'Show tray icon'}
+            desc={
+              'Keep the Cubby icon in the notification area. When hidden, open Cubby with your shortcut or by launching it again. The icon comes back on its own if no shortcut is available.'
+            }
+            control={
+              <Toggle
+                checked={showTrayIcon}
+                onChange={handleTrayIconToggle}
+                label={'Show tray icon'}
+              />
+            }
+          />
+          <Row
+            title={'Quit Cubby'}
+            desc={'Stop Cubby and clipboard history until you start it again.'}
+            control={
+              <button onClick={handleQuit} className={ghostButton}>
+                {'Quit'}
+              </button>
+            }
+          />
         </SettingCard>
       </section>
 
@@ -272,7 +323,7 @@ export function GeneralTab({ settings, updateSetting }: GeneralTabProps) {
             {settings.replace_win_v && (
               <p className="mt-3 text-xs text-muted-foreground">
                 {
-                  "Replace Windows clipboard shortcut also lets your hotkey open Cubby inside remote sessions when the remote client's keyboard forwarding is off. With forwarding on, open Cubby from the tray icon."
+                  "Replace Windows clipboard shortcut also lets your hotkey open Cubby inside remote sessions when the remote client's keyboard forwarding is off. With forwarding on, open Cubby from the tray icon, or from the Start menu if the icon is hidden."
                 }
               </p>
             )}

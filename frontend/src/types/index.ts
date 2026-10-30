@@ -69,6 +69,7 @@ export interface Settings {
   mica_effect?: string;
   round_corners?: boolean;
   float_above_taskbar?: boolean;
+  show_tray_icon?: boolean;
   density?: 'compact' | 'comfortable';
   remote_paste_mode: 'copy_then_paste' | 'paste_as_keystrokes';
   remote_clipboard_relay?: boolean;
