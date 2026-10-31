@@ -13,10 +13,11 @@ on:
       - src-tauri/tauri.conf.json
       - src-tauri/tauri.store.conf.json
       - .github/workflows/release-cache.yml
-  # GitHub evicts a cache nobody has read for 7 days. Releases can be further
-  # apart than that, so touch the cache weekly; an exact hit skips the build.
+  # GitHub evicts a cache nobody has read for 7 days, and releases can be
+  # further apart than that. Touch it twice a week so a delayed scheduled run
+  # still lands inside the window; an exact hit skips the build.
   schedule:
-    - cron: '17 6 * * 1'
+    - cron: '17 6 * * 1,4'
   workflow_dispatch:
 
 permissions:

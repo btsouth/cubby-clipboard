@@ -16,8 +16,10 @@ permissions:
 env:
   # Pinned so the audit tool cannot change under us on an unrelated run, and so
   # the cache key below is tied to an exact version. Bumping this string is what
-  # forces a fresh compile.
-  CARGO_AUDIT_VERSION: 0.22.2
+  # forces a fresh compile. Not CARGO_-prefixed: rust-cache hashes every CARGO_*
+  # variable into its key, which would stop release.yml's validate job (which
+  # does not set it) from restoring the shared windows-tests cache.
+  AUDIT_TOOL_VERSION: 0.22.2
 
 jobs:
   test:
@@ -86,10 +88,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-audit.exe
-          key: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}
+          key: ${{ runner.os }}-cargo-audit-${{ env.AUDIT_TOOL_VERSION }}
 
       - if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-audit --locked --version ${{ env.CARGO_AUDIT_VERSION }}
+        run: cargo install cargo-audit --locked --version ${{ env.AUDIT_TOOL_VERSION }}
 
       # Cheap insurance that a cache hit actually restored the tool we pinned,
       # so a bad entry fails here with a clear message rather than somewhere
@@ -101,9 +103,9 @@ jobs:
           # Match the version as a whole token, so a pin of 0.22.2 is not
           # satisfied by 0.22.20. Deliberately not anchored on the tool name:
           # the binary reports itself as "cargo-audit-audit <version>".
-          $pattern = '(?:^|\s)' + [regex]::Escape($env:CARGO_AUDIT_VERSION) + '(?:\s|$)'
+          $pattern = '(?:^|\s)' + [regex]::Escape($env:AUDIT_TOOL_VERSION) + '(?:\s|$)'
           if ($actual -notmatch $pattern) {
-            throw "Expected cargo-audit $env:CARGO_AUDIT_VERSION on PATH, got: $actual"
+            throw "Expected cargo-audit $env:AUDIT_TOOL_VERSION on PATH, got: $actual"
           }
           Write-Host "cargo-audit verified: $actual"
 
