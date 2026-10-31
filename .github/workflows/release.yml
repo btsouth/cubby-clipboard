@@ -38,11 +38,15 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # Cache the cargo registry + src-tauri/target across runs so the cargo test
-      # and clippy compiles below are incremental instead of cold every run.
+      # Restore CI's test cache from main (ci.yml saves it under the same
+      # shared key). A tag can only read caches saved on main, and a cache
+      # saved under a tag is never read again, so this job does not save.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          shared-key: windows-tests
+          cache-bin: "false"
+          save-if: false
 
       # Install a prebuilt cargo-audit binary instead of compiling it from source
       # (cargo install cargo-audit) on every run.
@@ -175,14 +179,17 @@ jobs:
           prerelease: ${{ steps.metadata.outputs.prerelease }}
 
   build-installers:
-    name: Build ${{ matrix.arch }} installer
+    # One leg per installer: the regular and Store builds compile with
+    # different features, so running them in one job serialized two release
+    # compiles (about 9 and 6 minutes cold) on the critical path.
+    name: Build ${{ matrix.arch }} ${{ matrix.variant == 'store' && 'Store ' || '' }}installer
     needs: create-release
     runs-on: windows-latest
-    # A normal build is ~20 minutes; the arm64 compile alone is ~12. The
-    # v1.3.0 attempt hung for 52 minutes inside the build-time signing command
-    # with nothing on stdout, and would have run to the six-hour default had it
-    # not been cancelled by hand. 45 leaves better than 2x headroom over a cold
-    # cache while still failing a hang inside the hour.
+    # A cold leg is ~12 minutes. The v1.3.0 attempt hung for 52 minutes inside
+    # the build-time signing command with nothing on stdout, and would have run
+    # to the six-hour default had it not been cancelled by hand. 45 leaves
+    # better than 2x headroom over a cold cache while still failing a hang
+    # inside the hour.
     timeout-minutes: 45
     environment: release
     permissions:
@@ -194,8 +201,16 @@ jobs:
         include:
           - arch: x64
             target: x86_64-pc-windows-msvc
+            variant: app
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            variant: store
           - arch: arm64
             target: aarch64-pc-windows-msvc
+            variant: app
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            variant: store
     env:
       # Tauri runs signCommand with captured stdio and discards it on failure,
       # so scripts/sign-windows.ps1 mirrors its output here and the "Dump the
@@ -219,12 +234,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Per-target cargo cache (keyed by matrix.target so x64 and arm64 don't
-      # clobber each other) to keep the installer compiles incremental.
+      # Per-target release cache, saved on main by release-cache.yml with both
+      # variants' dependencies. A tag can only read caches saved on main, and a
+      # cache saved under a tag is never read again, so this job does not save.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
-          key: ${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
+          cache-bin: "false"
+          save-if: false
 
       - run: pnpm install --frozen-lockfile
 
@@ -264,6 +282,7 @@ jobs:
         run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.8 -Force -Repository PSGallery
 
       - name: Build NSIS installer
+        if: matrix.variant == 'app'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           # createUpdaterArtifacts is on, so the build needs the updater key.
@@ -283,6 +302,7 @@ jobs:
           args: --target ${{ matrix.target }} --bundles nsis
 
       - name: Locate the built installer
+        if: matrix.variant == 'app'
         id: installer
         shell: pwsh
         run: |
@@ -313,13 +333,12 @@ jobs:
 
           $stagedBinary = Join-Path $env:RUNNER_TEMP "cubby-${{ matrix.arch }}.exe"
           Copy-Item $binary $stagedBinary -Force
-          # Stage the slim installer before the Store build overwrites Tauri's
-          # default NSIS output path and app binary.
           "path=$stagedPath" >> $env:GITHUB_OUTPUT
           "name=$name" >> $env:GITHUB_OUTPUT
           "binary_path=$stagedBinary" >> $env:GITHUB_OUTPUT
 
       - name: Build offline Microsoft Store installer
+        if: matrix.variant == 'store'
         shell: pwsh
         env:
           ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
@@ -335,6 +354,7 @@ jobs:
             --config src-tauri/tauri.store.conf.json
 
       - name: Locate the offline Store installer
+        if: matrix.variant == 'store'
         id: store-installer
         shell: pwsh
         run: |
@@ -350,13 +370,13 @@ jobs:
             Write-Error "Store installer is too small to contain the offline WebView2 runtime"
             exit 1
           }
-          # The Store build is a second `tauri build`, so it runs signCommand
-          # again over its own copy of the app binary. Verify it independently.
+          # The Store build runs signCommand over its own copy of the app
+          # binary. Verify it independently.
           ./scripts/verify-installer-signature.ps1 -Installer $stagedPath -ExpectedSubject "CN=Brandon South, O=Brandon South, L=Wilmore, S=ky, C=US"
           "path=$stagedPath" >> $env:GITHUB_OUTPUT
           "name=$name" >> $env:GITHUB_OUTPUT
 
-      # Runs for a failure in either bundle build above. Without it a failing
+      # Runs for a failure in the bundle build above. Without it a failing
       # signCommand reports only `failed to bundle project: failed to run pwsh`,
       # because Tauri captures the command's output and drops it on error.
       - name: Dump the signing log
@@ -369,38 +389,35 @@ jobs:
             Write-Host "No signing log at $env:CUBBY_SIGN_LOG - signCommand never reached scripts/sign-windows.ps1."
           }
 
-      # The installers themselves are signed here rather than by signCommand,
-      # because the Store installer is copied out to a staging path after the
-      # build and the updater .sig has to be regenerated over the final bytes.
-      - name: Sign the installers with Trusted Signing
+      # The installer itself is signed here rather than by signCommand,
+      # because it is copied out to a staging path after the build and the
+      # updater .sig has to be regenerated over the final bytes.
+      - name: Sign the installer with Trusted Signing
         uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: |
-            ${{ steps.installer.outputs.path }}
-            ${{ steps.store-installer.outputs.path }}
+          files: ${{ matrix.variant == 'store' && steps.store-installer.outputs.path || steps.installer.outputs.path }}
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Upload the signed installers
+      - name: Upload the signed installer
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          INSTALLER_PATH: ${{ matrix.variant == 'store' && steps.store-installer.outputs.path || steps.installer.outputs.path }}
+          INSTALLER_NAME: ${{ matrix.variant == 'store' && steps.store-installer.outputs.name || steps.installer.outputs.name }}
         run: |
-          Copy-Item "${{ steps.installer.outputs.path }}" "${{ steps.installer.outputs.name }}"
-          Copy-Item "${{ steps.store-installer.outputs.path }}" "${{ steps.store-installer.outputs.name }}"
+          Copy-Item $env:INSTALLER_PATH $env:INSTALLER_NAME
           ./scripts/upload-release-asset.ps1 `
             -ReleaseId $env:RELEASE_ID `
-            -AssetPath @(
-              "${{ steps.installer.outputs.name }}",
-              "${{ steps.store-installer.outputs.name }}"
-            )
+            -AssetPath $env:INSTALLER_NAME
 
       - name: Re-sign the installer for the updater (over the signed bytes)
+        if: matrix.variant == 'app'
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -413,6 +430,7 @@ jobs:
           Copy-Item "${{ steps.installer.outputs.path }}.sig" "${{ steps.installer.outputs.name }}.sig"
 
       - name: Upload the updater signature
+        if: matrix.variant == 'app'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -423,7 +441,7 @@ jobs:
             -AssetPath "${{ steps.installer.outputs.name }}.sig"
 
       - name: Publish Microsoft Store installer to Cloudflare R2
-        if: github.event_name != 'workflow_dispatch'
+        if: matrix.variant == 'store' && github.event_name != 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -454,7 +472,7 @@ jobs:
             -ReleaseTag $env:TAG
 
       - name: Assemble the portable package
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'x64' && matrix.variant == 'app'
         id: portable
         shell: pwsh
         run: |
@@ -495,7 +513,7 @@ jobs:
           "exe=$(Join-Path $stage 'Cubby Clipboard.exe')" >> $env:GITHUB_OUTPUT
 
       - name: Sign the portable executable
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'x64' && matrix.variant == 'app'
         uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
@@ -507,7 +525,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Zip and upload the portable package
-        if: matrix.arch == 'x64'
+        if: matrix.arch == 'x64' && matrix.variant == 'app'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

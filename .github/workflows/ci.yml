@@ -46,7 +46,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
-          key: ci-tests
+          # Shared with release.yml's validate job, which runs the same cargo
+          # test and clippy. A tag run can only restore caches saved on main,
+          # so this is what keeps release validation from compiling cold.
+          shared-key: windows-tests
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: pnpm install --frozen-lockfile
