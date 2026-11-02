@@ -40,3 +40,7 @@ Acceptance:
   leave any modifier or letter key logically held.
 - If the helper exits unexpectedly, Cubby restarts it.
 - If Cubby exits unexpectedly, the helper detects the parent exit and stops.
+- After a restart with Startup with Windows on, the first `Win+V` opens Cubby, including when:
+  - another app holds `Win+Alt+V` while Cubby starts
+  - an app that starts after Cubby installs a keyboard hook that does not call the next hook
+- Turning replacement off restores native Windows Clipboard History even while another app holds the configured hotkey.

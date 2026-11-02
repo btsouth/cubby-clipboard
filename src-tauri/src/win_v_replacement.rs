@@ -134,6 +134,15 @@ impl WinVReplacementManager {
         self.inner.activation_port != 0
     }
 
+    /// Whether Win+V replacement is on and its helper was started this session.
+    pub fn is_enabled(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.desired && state.child.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn configure(&self, enabled: bool, hotkey: Option<String>) -> Result<(), String> {
         if enabled && self.inner.activation_port == 0 {
             return Err("Cubby shortcut channel is unavailable this session".to_string());

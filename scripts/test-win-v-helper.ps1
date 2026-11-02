@@ -44,7 +44,7 @@ if (-not ("CubbyShortcutTestInput" -as [type])) {
 }
 
 $keyUp = 0x0002
-$testMarker = [UIntPtr]0x43554254
+$testMarker = New-Object UIntPtr ([uint64]0x43554254)
 $keys = @{
     Ctrl = 0xA2
     Shift = 0xA0
@@ -76,6 +76,90 @@ function Send-WinV {
 function Release-TestKeys {
     foreach ($key in @($keys.V, $keys.Shift, $keys.Ctrl, $keys.Win, 0x5C, 0xA1, 0xA3, 0xA4, 0xA5)) {
         [CubbyShortcutTestInput]::keybd_event([byte]$key, 0, $keyUp, $testMarker)
+    }
+}
+
+# Stands in for an app that starts after Cubby and breaks the hook chain: it
+# returns without calling the next hook, so older hooks never see the key while
+# Windows still acts on it (#376).
+$chainBreakingHook = @'
+param([int]$Milliseconds, [string]$ReadyPath)
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+public static class ChainBreakingHook {
+    delegate IntPtr Proc(int code, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    struct Msg { public IntPtr h; public uint m; public IntPtr w; public IntPtr l; public uint t; public int x; public int y; }
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr SetWindowsHookEx(int id, Proc proc, IntPtr module, uint thread);
+    [DllImport("user32.dll")]
+    static extern bool PeekMessage(out Msg message, IntPtr window, uint min, uint max, uint remove);
+    static Proc keep = (code, wParam, lParam) => IntPtr.Zero;
+    public static void Run(int milliseconds, string readyPath) {
+        if (SetWindowsHookEx(13, keep, IntPtr.Zero, 0) == IntPtr.Zero) { throw new Exception("hook failed"); }
+        System.IO.File.WriteAllText(readyPath, "ready");
+        var clock = Stopwatch.StartNew();
+        Msg message;
+        while (clock.ElapsedMilliseconds < milliseconds) {
+            while (PeekMessage(out message, IntPtr.Zero, 0, 0, 1)) { }
+            Thread.Sleep(2);
+        }
+    }
+}
+"@
+[ChainBreakingHook]::Run($Milliseconds, $ReadyPath)
+'@
+
+function Wait-Until([scriptblock]$condition, [int]$seconds, [string]$failure) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while (-not (& $condition)) {
+        if ((Get-Date) -gt $deadline) {
+            throw $failure
+        }
+        Start-Sleep -Milliseconds 50
+    }
+}
+
+# A helper started before a chain-breaking hook must take back the front of the
+# chain. With no reassert window it must not, which also proves the stand-in
+# really does hide keys from the helper.
+function Get-ActivationsBehindChainBreakingHook([int]$ReassertWindowSeconds) {
+    $tag = "cubby-win-v-chain-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
+    $out = Join-Path $env:TEMP "$tag.out.log"
+    $err = Join-Path $env:TEMP "$tag.err.log"
+    $ready = Join-Path $env:TEMP "$tag.ready"
+    $script = Join-Path $env:TEMP "$tag.ps1"
+    Set-Content -LiteralPath $script -Value $chainBreakingHook
+    $helper = $null
+    $hook = $null
+    try {
+        $helper = Start-Process -FilePath $helperPath -WindowStyle Hidden -PassThru `
+            -ArgumentList @("--timeout-seconds", 30, "--accept-injected-test-events",
+                "--hook-reassert-window-seconds", $ReassertWindowSeconds) `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        Wait-Until { (Test-Path -LiteralPath $out) -and ((Get-Content -LiteralPath $out -Raw) -match '"event":"ready"') } 20 "Helper did not become ready"
+        $hook = Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -PassThru `
+            -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script, "-Milliseconds", 30000, "-ReadyPath", $ready)
+        Wait-Until { Test-Path -LiteralPath $ready } 20 "Chain-breaking hook did not become ready"
+        # Longer than the helper's reassert interval.
+        Start-Sleep -Seconds 3
+        Send-WinV
+        Start-Sleep -Milliseconds 500
+        # If the chord reached Windows, close Clipboard History again.
+        Send-KeyTap 0x1B
+        return @(Get-Content -LiteralPath $out | Where-Object { $_ -match '"event":"win_v"' }).Count
+    }
+    finally {
+        foreach ($started in @($helper, $hook)) {
+            if ($started -and -not $started.HasExited) {
+                Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Release-TestKeys
+        Remove-Item -LiteralPath $script, $ready -ErrorAction SilentlyContinue
     }
 }
 
@@ -162,9 +246,19 @@ try {
         throw "Test keys remain logically down: $($keysStillDown -join ', ')"
     }
 
+    $withoutReassert = Get-ActivationsBehindChainBreakingHook -ReassertWindowSeconds 0
+    if ($withoutReassert -ne 0) {
+        throw "Expected the chain-breaking hook to hide Win+V without reassert, observed $withoutReassert activations"
+    }
+    $withReassert = Get-ActivationsBehindChainBreakingHook -ReassertWindowSeconds 60
+    if ($withReassert -ne 1) {
+        throw "Expected 1 Win+V activation after reassert, observed $withReassert"
+    }
+
     [pscustomobject]@{
         Passed = $true
         Activations = $activationCount
+        ActivationsBehindChainBreakingHook = $withReassert
         WinRestorations = $restoreCount
         KeysStillDown = 0
         Log = $stdoutPath

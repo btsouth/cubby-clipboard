@@ -73,6 +73,7 @@ pub async fn save_settings(
 ) -> Result<(), String> {
     let manager = app.state::<Arc<SettingsManager>>();
 
+    let _shortcut_changes = crate::shortcuts::lock_shortcut_changes();
     let current = manager.get();
     let portable = crate::portable_data_dir().is_some();
     let app_store_build = cfg!(feature = "app-store");
@@ -101,11 +102,19 @@ pub async fn save_settings(
     let shortcut_settings_changed = new_settings.hotkey != current.hotkey
         || new_settings.replace_win_v != current.replace_win_v;
     if shortcut_settings_changed {
-        crate::shortcuts::register_shortcuts(
+        if let Err(error) = crate::shortcuts::register_shortcuts(
             &app,
             &new_settings.hotkey,
             new_settings.replace_win_v,
-        )?;
+        ) {
+            // A new hotkey that is taken is a real failure. The same hotkey still
+            // being taken must not stop the Win+V setting from applying, or the
+            // user could not get native Win+V back while that app runs.
+            if new_settings.hotkey != current.hotkey {
+                return Err(error);
+            }
+            log::warn!("SETTINGS: Applying the Win+V change anyway: {error}");
+        }
     }
 
     // Reconfigure the helper whenever the hotkey or the replacement toggle

@@ -5,7 +5,8 @@
 - New installations use `Win+Alt+V`.
 - Win+V replacement is enabled by default and can be disabled in Settings.
 - The shortcut is customizable.
-- If the configured shortcut is unavailable at startup, Cubby falls back to `Win+Ctrl+Alt+V` and persists the fallback.
+- If the configured shortcut is unavailable at startup, Cubby uses `Win+Ctrl+Alt+V` for now and keeps trying to get the configured one back for ten minutes. The saved setting does not change, and the next launch tries it again.
+- A shortcut conflict at startup does not turn off Win+V replacement, because the helper does not need a global shortcut to reach Cubby.
 - Changing to a conflicting shortcut keeps the previous working shortcut and returns a visible error.
 
 ## Win+V
@@ -30,6 +31,13 @@ The helper ignores its own injected events, restores the physical Windows-key
 state before unrelated input continues, and exits independently if Cubby
 disables replacement mode.
 
+Windows calls the newest low-level keyboard hook first, and a hook that does not
+call the next one hides the key from older hooks while Windows still acts on it.
+Apps that start after Cubby at sign-in can do this, so for five minutes after it
+starts the helper moves its hook back to the front every two seconds. It skips
+this while a supported remote client is in the foreground, and stops after five
+minutes so a remote client opened later keeps priority (see below).
+
 Cubby monitors the helper and restarts it after an unexpected exit. The helper
 also monitors its parent process, so a Cubby crash cannot leave the hook behind.
 Disabling replacement or exiting Cubby restores native Windows Clipboard History.
@@ -49,7 +57,9 @@ This works only when the remote client's own keyboard forwarding is off. Clients
 such as Ninja Remote install their own keyboard capture when forwarding is on,
 and because that capture loads after Cubby's it runs ahead of Cubby's hook and
 consumes the keys first. With forwarding off, Cubby's hook wins. When forwarding
-must stay on, open Cubby from the tray instead.
+must stay on, open Cubby from the tray instead. In the helper's first five
+minutes, a client that loses the foreground can end up behind Cubby's hook until
+it next installs its capture.
 
 The trigger is active only for supported remote clients, including Ninja Remote,
 Windows Remote Desktop, AnyDesk, TeamViewer, ScreenConnect, Splashtop, and
