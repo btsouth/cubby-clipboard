@@ -437,90 +437,49 @@ pub fn run_app() {
             }
 
             let manager = app_handle.state::<Arc<SettingsManager>>();
-            let mut shortcut_settings = manager.get();
-            let user_hotkey = shortcut_settings.hotkey.clone();
+            let shortcut_settings = manager.get();
+            let saved_hotkey = shortcut_settings.hotkey.clone();
+            let replace_win_v = shortcut_settings.replace_win_v;
             // Startup conflicts recover for this session only and are surfaced
-            // as a toast. The user's configured hotkey is never persisted over:
-            // a transient conflict at boot (another app briefly holding the
-            // key) must not permanently rewrite their choice, and the next
-            // launch retries the original settings.
-            let mut shortcuts_ready = match shortcuts::register_shortcuts(
-                &app_handle,
-                &shortcut_settings.hotkey,
-                shortcut_settings.replace_win_v,
-            ) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::error!("SHORTCUT: Startup registration failed: {}", error);
-                    let replacement_disabled = shortcut_settings.replace_win_v
-                        && shortcuts::register_shortcuts(
-                            &app_handle,
-                            &shortcut_settings.hotkey,
-                            false,
-                        )
-                        .is_ok();
-
-                    if replacement_disabled {
-                        shortcut_settings.replace_win_v = false;
-                        log::warn!(
-                            "SHORTCUT: Disabled Win+V replacement for this session after startup conflict"
-                        );
-                        shortcuts::record_startup_notice(
-                            "win_v_disabled",
-                            &user_hotkey,
-                            Some(&user_hotkey),
-                        );
-                        true
-                    } else {
-                        let fallback = "Win+Ctrl+Alt+V";
-                        if shortcut_settings.hotkey != fallback
-                            && shortcuts::register_shortcuts(&app_handle, fallback, false).is_ok()
-                        {
-                            shortcut_settings.hotkey = fallback.to_string();
-                            shortcut_settings.replace_win_v = false;
-                            log::warn!("SHORTCUT: Fell back to {} for this session", fallback);
-                            shortcuts::record_startup_notice(
-                                "fallback_hotkey",
-                                &user_hotkey,
-                                Some(fallback),
-                            );
-                            true
-                        } else {
-                            shortcut_settings.replace_win_v = false;
-                            false
-                        }
-                    }
-                }
-            };
-
+            // as a toast. The user's settings are never persisted over: a
+            // transient conflict at boot must not rewrite their choice, and
+            // recovery below keeps trying to reach those settings.
+            let registration =
+                shortcuts::register_at_startup(&app_handle, &saved_hotkey, replace_win_v);
             let replacement =
                 app_handle.state::<Arc<win_v_replacement::WinVReplacementManager>>();
-            if !shortcuts_ready {
-                shortcut_settings.replace_win_v = false;
-            }
-            if let Err(error) = replacement.configure(
-                shortcuts_ready && shortcut_settings.replace_win_v,
-                Some(shortcut_settings.hotkey.clone()),
+            let helper_failed = match replacement.configure(
+                replace_win_v,
+                Some(
+                    registration
+                        .active_hotkey
+                        .clone()
+                        .unwrap_or_else(|| saved_hotkey.clone()),
+                ),
             ) {
-                log::error!("WIN_V: Startup failed: {}", error);
-                shortcut_settings.replace_win_v = false;
-                shortcuts_ready = shortcuts::register_shortcuts(
-                    &app_handle,
-                    &shortcut_settings.hotkey,
-                    false,
-                )
-                .is_ok();
-                if shortcuts_ready {
-                    shortcuts::record_startup_notice(
-                        "win_v_disabled",
-                        &user_hotkey,
-                        Some(&shortcut_settings.hotkey),
-                    );
+                Ok(()) => false,
+                Err(error) => {
+                    log::error!("WIN_V: Startup failed: {}", error);
+                    true
                 }
-            }
+            };
+            let shortcuts_ready = registration.active_hotkey.is_some();
             if !shortcuts_ready {
                 log::error!("SHORTCUT: Cubby started without a working global shortcut");
-                shortcuts::record_startup_notice("failed", &user_hotkey, None);
+            }
+            if let Some(kind) = shortcuts::startup_notice_kind(
+                &saved_hotkey,
+                registration.active_hotkey.as_deref(),
+                helper_failed,
+            ) {
+                shortcuts::record_startup_notice(
+                    kind,
+                    &saved_hotkey,
+                    registration.active_hotkey.as_deref(),
+                );
+            }
+            if !registration.complete || (helper_failed && replacement.is_available()) {
+                shortcuts::spawn_startup_recovery(app_handle.clone(), saved_hotkey);
             }
             SHORTCUT_READY.store(shortcuts_ready, Ordering::SeqCst);
             apply_tray_visibility(&app_handle);

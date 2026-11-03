@@ -4,6 +4,12 @@ All notable Cubby Clipboard changes are documented here. PastePaw entries below 
 
 ## Unreleased
 
+### Fixed
+- Win+V could open Windows Clipboard History after a restart even though "Replace Windows clipboard shortcut" was on, until the setting was turned off and on again. Cubby now keeps Win+V working when another app holds its hotkey during startup, gets the hotkey back once it is free, and keeps its keyboard hook ahead of apps that start after it. (#376)
+
+### Thanks
+- Thanks to [stefanmm](https://github.com/stefanmm) for reporting the Win+V restart bug (#376)
+
 ## v1.3.8
 
 ### Added

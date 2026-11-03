@@ -6,7 +6,7 @@ mod windows_helper {
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::Threading::{
@@ -20,13 +20,23 @@ mod windows_helper {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-        GetWindowThreadProcessId, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
-        UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
-        WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        GetWindowThreadProcessId, KillTimer, PostThreadMessageW, SetTimer, SetWindowsHookExW,
+        TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+        MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
     };
 
     const DUMMY_KEY: u16 = 0x00FF;
     const CUBBY_INJECTED_FLAG: usize = 0x4355_4242;
+
+    /// Windows calls the newest low-level hook first, and a hook that does not
+    /// call the next one hides the key from every older hook while Windows
+    /// still acts on it. Apps that start after Cubby at sign-in can do that, so
+    /// Win+V reached Windows until the helper was restarted (#376). For a while
+    /// after starting, the helper keeps moving its hook back to the front. It
+    /// stops after that so a remote client opened later can still capture keys
+    /// ahead of Cubby, as docs/SHORTCUT_BEHAVIOR.md describes.
+    const HOOK_REASSERT_INTERVAL: Duration = Duration::from_secs(2);
+    const HOOK_REASSERT_WINDOW: Duration = Duration::from_secs(5 * 60);
 
     static STATE: OnceLock<Mutex<RemapState>> = OnceLock::new();
     static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -76,6 +86,22 @@ mod windows_helper {
     }
 
     impl RemapState {
+        /// Another hook ahead of this one can hide a Win release. Without this,
+        /// a plain V after the hook gets back to the front would count as the
+        /// chord. Once the helper has released Win itself, the live key state
+        /// cannot tell a missed release apart, so that case is left alone.
+        fn forget_missed_win_release(&mut self, win_is_down: impl Fn(u16) -> bool) {
+            if self.logical_win_released {
+                return;
+            }
+            if self
+                .physical_win
+                .is_some_and(|win_key| !win_is_down(win_key))
+            {
+                *self = Self::default();
+            }
+        }
+
         fn handle(
             &mut self,
             key: u16,
@@ -543,11 +569,18 @@ mod windows_helper {
             true
         };
 
-        let decision = STATE
-            .get_or_init(|| Mutex::new(RemapState::default()))
-            .lock()
-            .expect("Win+V state mutex poisoned")
-            .handle(key, is_down, is_up, exact_match, event.time);
+        let decision = {
+            let mut state = STATE
+                .get_or_init(|| Mutex::new(RemapState::default()))
+                .lock()
+                .expect("Win+V state mutex poisoned");
+            if key == VK_V.0 && is_down {
+                state.forget_missed_win_release(|win_key| unsafe {
+                    GetAsyncKeyState(win_key as i32) < 0
+                });
+            }
+            state.handle(key, is_down, is_up, exact_match, event.time)
+        };
 
         match decision {
             Decision::Pass => unsafe { CallNextHookEx(None, code, wparam, lparam) },
@@ -596,6 +629,33 @@ mod windows_helper {
             .find(|pair| pair[0] == "--timeout-seconds")
             .and_then(|pair| pair[1].parse::<u64>().ok())
             .unwrap_or(300)
+    }
+
+    fn parse_hook_reassert_window() -> Duration {
+        let args: Vec<String> = env::args().collect();
+        args.windows(2)
+            .find(|pair| pair[0] == "--hook-reassert-window-seconds")
+            .and_then(|pair| pair[1].parse::<u64>().ok())
+            .map_or(HOOK_REASSERT_WINDOW, Duration::from_secs)
+    }
+
+    /// Moves the hook to the front of the chain. The hook thread runs this
+    /// between messages, so no key can reach both hooks while they overlap. If
+    /// the new hook cannot be installed the current one stays in place.
+    fn reassert_hook(current: HHOOK) -> HHOOK {
+        match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
+            Ok(replacement) => {
+                let _ = unsafe { UnhookWindowsHookEx(current) };
+                replacement
+            }
+            Err(error) => {
+                emit(
+                    "hook_reassert_failed",
+                    Some(&format!("could not reinstall the Win+V hook: {error}")),
+                );
+                current
+            }
+        }
     }
 
     fn parse_parent_pid() -> Option<u32> {
@@ -695,8 +755,10 @@ mod windows_helper {
             });
         }
 
-        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
+        let mut hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
             .map_err(|error| format!("failed to install Win+V hook: {error}"))?;
+        let installed_at = Instant::now();
+        let reassert_window = parse_hook_reassert_window();
 
         println!(
             "{}",
@@ -713,8 +775,17 @@ mod windows_helper {
         );
 
         unsafe {
+            let reassert_timer = SetTimer(None, 0, HOOK_REASSERT_INTERVAL.as_millis() as u32, None);
             let mut message = MSG::default();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                if message.message == WM_TIMER && message.wParam.0 == reassert_timer {
+                    if installed_at.elapsed() >= reassert_window {
+                        let _ = KillTimer(None, reassert_timer);
+                    } else if !foreground_is_supported_remote() {
+                        hook = reassert_hook(hook);
+                    }
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -753,6 +824,46 @@ mod windows_helper {
             assert_eq!(
                 state.handle(VK_LWIN.0, false, true, true, 40),
                 Decision::Suppress
+            );
+        }
+
+        #[test]
+        fn a_missed_win_release_does_not_turn_plain_v_into_the_chord() {
+            let mut state = RemapState::default();
+            state.handle(VK_LWIN.0, true, false, true, 10);
+            // The Win release happened while another hook hid it from this one.
+            state.forget_missed_win_release(|_| false);
+            assert_eq!(state.handle(VK_V.0, true, false, true, 20), Decision::Pass);
+        }
+
+        #[test]
+        fn a_held_win_key_still_makes_the_chord() {
+            let mut state = RemapState::default();
+            state.handle(VK_LWIN.0, true, false, true, 10);
+            state.forget_missed_win_release(|key| key == VK_LWIN.0);
+            assert_eq!(
+                state.handle(VK_V.0, true, false, true, 20),
+                Decision::Activate {
+                    win_key: VK_LWIN.0,
+                    release_physical_win: true
+                }
+            );
+        }
+
+        #[test]
+        fn win_released_by_the_helper_keeps_retriggering() {
+            let mut state = RemapState::default();
+            state.handle(VK_LWIN.0, true, false, true, 10);
+            state.handle(VK_V.0, true, false, true, 20);
+            state.handle(VK_V.0, false, true, true, 30);
+            // Win reads as up here because the helper released it on purpose.
+            state.forget_missed_win_release(|_| false);
+            assert_eq!(
+                state.handle(VK_V.0, true, false, true, 40),
+                Decision::Activate {
+                    win_key: VK_LWIN.0,
+                    release_physical_win: false
+                }
             );
         }
 

@@ -193,30 +193,23 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Startup shortcut recovery happens before the webview loads, so pull the
-  // notice instead of listening for an event, and hold it until the flyout is
-  // actually visible — a toast fired into a hidden window would expire unseen.
-  const pendingHotkeyNotice = useRef<HotkeyStartupNotice | null>(null);
-  useEffect(() => {
+  // Pull the startup shortcut notice when the flyout gains focus. A toast fired
+  // into a hidden window would expire unseen, and asking only now means a
+  // problem that recovered in the background is never reported.
+  const showHotkeyStartupNotice = useCallback(() => {
     if (assetCaptureEnabled) return;
     invoke<HotkeyStartupNotice | null>('get_hotkey_startup_notice')
       .then((notice) => {
-        pendingHotkeyNotice.current = notice;
+        if (!notice) return;
+        const message =
+          notice.kind === 'fallback_hotkey'
+            ? `${notice.requested_hotkey} is in use by another app. Using ${notice.active_hotkey} for this session — your setting is unchanged.`
+            : notice.kind === 'win_v_disabled'
+              ? `Win+V replacement is unavailable right now. Open Cubby with ${notice.active_hotkey ?? notice.requested_hotkey} for this session.`
+              : 'No global hotkey could be registered. Open Cubby from the tray icon and try a different hotkey in Settings.';
+        toast.warning(message, { duration: 10000 });
       })
       .catch(console.error);
-  }, []);
-
-  const showPendingHotkeyNotice = useCallback(() => {
-    const notice = pendingHotkeyNotice.current;
-    if (!notice) return;
-    pendingHotkeyNotice.current = null;
-    const message =
-      notice.kind === 'fallback_hotkey'
-        ? `${notice.requested_hotkey} is in use by another app. Using ${notice.active_hotkey} for this session — your setting is unchanged.`
-        : notice.kind === 'win_v_disabled'
-          ? `Win+V replacement is unavailable right now. Open Cubby with ${notice.active_hotkey ?? notice.requested_hotkey} for this session.`
-          : 'No global hotkey could be registered. Open Cubby from the tray icon and try a different hotkey in Settings.';
-    toast.warning(message, { duration: 10000 });
   }, []);
 
   const refreshPasteContext = useCallback(() => {
@@ -240,7 +233,7 @@ function App() {
   useEffect(() => {
     const unlisten = appWindow.onFocusChanged(({ payload: focused }) => {
       if (focused) {
-        showPendingHotkeyNotice();
+        showHotkeyStartupNotice();
         return;
       }
       setSearchQuery('');
@@ -262,7 +255,7 @@ function App() {
     return () => {
       unlisten.then((dispose) => dispose()).catch(() => undefined);
     };
-  }, [appWindow, clearRevealed, showPendingHotkeyNotice]);
+  }, [appWindow, clearRevealed, showHotkeyStartupNotice]);
 
   const openSettings = useCallback(async () => {
     // Check if settings window already exists
