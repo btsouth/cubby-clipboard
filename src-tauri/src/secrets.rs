@@ -299,10 +299,7 @@ fn contains_token(text: &str, predicate: impl Fn(&str) -> bool) -> bool {
             start = idx + 1;
         }
     }
-    if start < text.len() && predicate(&text[start..]) {
-        return true;
-    }
-    false
+    start < text.len() && predicate(&text[start..])
 }
 
 fn is_token_separator(byte: u8) -> bool {
