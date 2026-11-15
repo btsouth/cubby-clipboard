@@ -25,7 +25,7 @@ SQLite before 3.54.0 can return stale process memory when it opens a database be
 
 The attack needs Cubby to open a database and `-wal` pair that someone else wrote. Cubby opens two kinds of database:
 
-- Its own history in the app data folder. Anyone who can write there already runs as the user and can read the history directly.
+- Its own history, in the app data folder or, in portable mode, in the `data` folder beside `cubby.exe`. Anyone who can write to the app data folder already runs as the user and can read the history directly. A portable copy kept where other accounts can write, such as a shared drive, does not have that protection, so keep portable Cubby in a folder only you can write to.
 - A Ditto database the user picks to import. Cubby copies only the `.db` file to a new temporary name and opens that copy read-only and immutable, so SQLite never reads a `-wal` file for it.
 
 `scripts/audit-rust.ps1` permits this advisory and fails if the Ditto import stops opening a private immutable copy. Remove the waiver as soon as SQLx accepts `libsqlite3-sys` 0.39 or newer.
