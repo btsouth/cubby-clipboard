@@ -19,6 +19,20 @@ The opener URL allowlist in `src-tauri/capabilities/default.json` is checked by 
 - Reviewed: 2026-10-21
 - Next review: 2027-01-21 (or immediately if SQLx or the lockfile graph changes)
 
+### RUSTSEC-2026-0459 waiver
+
+SQLite before 3.54.0 can return stale process memory when it opens a database beside a crafted `-wal` file with a different page size (CVE-2026-119375). The fix is in `libsqlite3-sys` 0.39. Cubby gets SQLite through SQLx, and SQLx 0.9.0, the newest release, still requires `libsqlite3-sys` below 0.38, so there is no patched version to move to yet.
+
+The attack needs Cubby to open a database and `-wal` pair that someone else wrote. Cubby opens two kinds of database:
+
+- Its own history, in the app data folder or, in portable mode, in the `data` folder beside `cubby.exe`. Anyone who can write to the app data folder already runs as the user and can read the history directly. A portable copy kept where other accounts can write, such as a shared drive, does not have that protection, so keep portable Cubby in a folder only you can write to.
+- A Ditto database the user picks to import. Cubby copies only the `.db` file to a new temporary name and opens that copy read-only and immutable, so SQLite never reads a `-wal` file for it.
+
+`scripts/audit-rust.ps1` permits this advisory and fails if the Ditto import stops opening a private immutable copy. Remove the waiver as soon as SQLx accepts `libsqlite3-sys` 0.39 or newer.
+
+- Reviewed: 2026-11-14
+- Next review: 2026-12-14 (or immediately when a newer SQLx is released or Cubby opens another outside database)
+
 
 ## Win+V helper channel
 
